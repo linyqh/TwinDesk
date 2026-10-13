@@ -1,0 +1,68 @@
+{
+  "SPThunderboltDataType" : [
+    {
+      "_name" : "thunderboltusb4_bus_3",
+      "device_name_key" : "MacBook Pro",
+      "domain_uuid_key" : "B9A72091-B208-4506-AEDA-566E0F607AA6",
+      "receptacle_1_tag" : {
+        "current_speed_key" : "Up to 40 Gb/s",
+        "link_status_key" : "0x100",
+        "micro_version_key" : "0.0.0",
+        "receptacle_id_key" : "4",
+        "receptacle_status_key" : "receptacle_no_devices_connected"
+      },
+      "route_string_key" : "0",
+      "switch_uid_key" : "0x05AC96BAAED940C3",
+      "vendor_name_key" : "Apple Inc."
+    },
+    {
+      "_items" : [
+        {
+          "_name" : "Mac Mini",
+          "device_id_key" : "0xA",
+          "device_name_key" : "Mac18,5",
+          "domain_uuid_key" : "DEDE747F-99CD-41AE-BE46-D25A41623095",
+          "services_title" : [
+            {
+              "_name" : "service_ip",
+              "protocol_id_key" : 1,
+              "protocol_revision_key" : 1,
+              "protocol_version_key" : 1,
+              "service_uuid_key" : "5A690171-E591-4118-B87F-64517751E588"
+            }
+          ],
+          "vendor_id_key" : "0x0A27",
+          "vendor_name_key" : "Apple Inc."
+        }
+      ],
+      "_name" : "thunderboltusb4_bus_1",
+      "device_name_key" : "MacBook Pro",
+      "domain_uuid_key" : "F3CD28CE-0B02-48CD-95A8-0A47CF510C77",
+      "receptacle_1_tag" : {
+        "current_speed_key" : "40 Gb/s",
+        "link_status_key" : "0x2",
+        "micro_version_key" : "0.0.0",
+        "receptacle_id_key" : "2",
+        "receptacle_status_key" : "receptacle_connected"
+      },
+      "route_string_key" : "0",
+      "switch_uid_key" : "0x05AC96BAAED940C1",
+      "vendor_name_key" : "Apple Inc."
+    },
+    {
+      "_name" : "thunderboltusb4_bus_0",
+      "device_name_key" : "MacBook Pro",
+      "domain_uuid_key" : "23E10F30-2EF5-42E6-AB0B-8064FD13D4C0",
+      "receptacle_1_tag" : {
+        "current_speed_key" : "Up to 40 Gb/s",
+        "link_status_key" : "0x100",
+        "micro_version_key" : "0.0.0",
+        "receptacle_id_key" : "1",
+        "receptacle_status_key" : "receptacle_no_devices_connected"
+      },
+      "route_string_key" : "0",
+      "switch_uid_key" : "0x05AC96BAAED940C0",
+      "vendor_name_key" : "Apple Inc."
+    }
+  ]
+}

@@ -6,11 +6,13 @@ struct CoreBindingTests {
     @Test func buildInfoComesFromRust() {
         let info = buildInfo()
         #expect(info.protocolMajor == 1)
-        #expect(info.serviceType == "_opensharemouse._udp")
+        #expect(info.defaultPort == 49001)
     }
 
-    @Test func newAgentIsLocal() throws {
-        #expect(try Agent().status() == .local)
+    @Test func agentStartsLocal() {
+        let status = Agent(deviceName: "test").status()
+        #expect(status.role == .local)
+        #expect(status.sharingEnabled)
     }
 
     @Test func permissionReportListsCaptureAndInjection() {

@@ -1,0 +1,12 @@
+//! Two-machine keyboard and mouse sharing over a Thunderbolt cable.
+//!
+//! `Engine::start` spawns the worker threads and returns a handle the UI
+//! polls for a `Status` snapshot. All session state is owned by one engine
+//! thread; other threads only feed it messages.
+
+mod engine;
+mod link;
+pub mod router;
+
+pub use engine::{Command, Engine, LinkState, PeerInfo, Status};
+pub use router::{EMERGENCY_FLAGS, Role};

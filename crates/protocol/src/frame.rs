@@ -60,14 +60,12 @@ pub fn decode_frame(buf: &mut BytesMut) -> Result<Option<Envelope>, FrameError> 
     Ok(Some(envelope))
 }
 
-/// Envelope header with the current protocol version filled in.
-pub fn envelope(request_id: u64, payload: crate::v1::envelope::Payload) -> Envelope {
+/// Envelope with the current protocol version filled in.
+pub fn envelope(payload: crate::v1::envelope::Payload) -> Envelope {
     Envelope {
         protocol_major: PROTOCOL_MAJOR,
         protocol_minor: PROTOCOL_MINOR,
-        request_id,
         payload: Some(payload),
-        ..Default::default()
     }
 }
 
@@ -79,18 +77,21 @@ mod tests {
     #[test]
     fn round_trips_across_partial_reads() {
         let mut wire = BytesMut::new();
-        encode_frame(&envelope(1, Payload::Ping(Ping { nonce: 7 })), &mut wire).unwrap();
-        encode_frame(&envelope(2, Payload::Ping(Ping { nonce: 8 })), &mut wire).unwrap();
+        encode_frame(&envelope(Payload::Ping(Ping { nonce: 7 })), &mut wire).unwrap();
+        encode_frame(&envelope(Payload::Ping(Ping { nonce: 8 })), &mut wire).unwrap();
 
         let mut rx = BytesMut::new();
         let mut got = Vec::new();
         for byte in wire {
             rx.put_u8(byte);
             while let Some(env) = decode_frame(&mut rx).unwrap() {
-                got.push(env.request_id);
+                let Some(Payload::Ping(p)) = env.payload else {
+                    panic!("not a ping")
+                };
+                got.push(p.nonce);
             }
         }
-        assert_eq!(got, vec![1, 2]);
+        assert_eq!(got, vec![7, 8]);
         assert!(rx.is_empty());
     }
 
@@ -106,7 +107,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_major() {
-        let mut env = envelope(1, Payload::Ping(Ping { nonce: 0 }));
+        let mut env = envelope(Payload::Ping(Ping { nonce: 0 }));
         env.protocol_major = PROTOCOL_MAJOR + 1;
         let mut wire = BytesMut::new();
         encode_frame(&env, &mut wire).unwrap();
@@ -118,7 +119,7 @@ mod tests {
 
     #[test]
     fn rejects_empty_payload() {
-        let mut env = envelope(1, Payload::Ping(Ping { nonce: 0 }));
+        let mut env = envelope(Payload::Ping(Ping { nonce: 0 }));
         env.payload = None;
         let mut wire = BytesMut::new();
         encode_frame(&env, &mut wire).unwrap();

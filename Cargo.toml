@@ -7,6 +7,7 @@ members = [
     "crates/transport",
     "crates/transfer",
     "crates/platform-macos",
+    "crates/agent",
     "crates/ffi",
     "tools/uniffi-bindgen-swift",
 ]
@@ -17,6 +18,7 @@ default-members = [
     "crates/transport",
     "crates/transfer",
     "crates/platform-macos",
+    "crates/agent",
     "crates/ffi",
 ]
 
@@ -34,6 +36,7 @@ osm-protocol = { path = "crates/protocol" }
 osm-transport = { path = "crates/transport" }
 osm-transfer = { path = "crates/transfer" }
 osm-platform-macos = { path = "crates/platform-macos" }
+osm-agent = { path = "crates/agent" }
 
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -45,6 +48,8 @@ prost-build = "0.14.4"
 protox = "0.10.0"
 uniffi = "0.32.2"
 tempfile = "3.27.0"
+libc = "0.2.190"
+socket2 = { version = "0.6.5", features = ["all"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

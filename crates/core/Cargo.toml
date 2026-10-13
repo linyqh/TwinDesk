@@ -1,6 +1,6 @@
 [package]
 name = "osm-core"
-description = "Control lease state machine, topology and input routing (report §4.3, §6). Sans-IO."
+description = "Screen-edge geometry and key handling rules. Sans-IO."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,6 @@ publish.workspace = true
 
 [dependencies]
 osm-model.workspace = true
-thiserror.workspace = true
 
 [lints]
 workspace = true

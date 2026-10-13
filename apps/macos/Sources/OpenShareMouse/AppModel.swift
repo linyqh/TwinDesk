@@ -2,57 +2,50 @@ import AppKit
 import Observation
 import OSMCore
 
-/// UI-facing state. Owns the Rust agent and polls cheap probes; it never
-/// decides control state itself; the Rust core does (report §4.1: the UI
-/// quitting or stalling must not leave the user stuck in remote control).
+/// UI-facing state. Owns the Rust agent and polls its status snapshot; it
+/// never makes control decisions itself, so a stalled UI cannot leave the
+/// user stuck controlling the other Mac.
 @MainActor
 @Observable
 final class AppModel {
-    private(set) var status: ControlStatus = .local
+    private(set) var status: AgentStatus
     private(set) var permissions: PermissionReport = probePermissions()
     let build: BuildInfo = buildInfo()
 
-    private let agent = Agent()
+    private let agent: Agent
     private var refreshTask: Task<Void, Never>?
 
     init() {
+        let name = Host.current().localizedName ?? "Mac"
+        agent = Agent(deviceName: name)
+        status = agent.status()
         refreshTask = Task { [weak self] in
             while !Task.isCancelled {
                 self?.refresh()
-                try? await Task.sleep(for: .seconds(2))
+                try? await Task.sleep(for: .milliseconds(300))
             }
         }
     }
 
     var allPermissionsGranted: Bool {
-        permissions.items.allSatisfy { $0.state == .granted }
-    }
-
-    var menuBarSymbol: String {
-        if !allPermissionsGranted { return "exclamationmark.triangle" }
-        switch status {
-        case .local: return "computermouse"
-        case .paused: return "pause.circle"
-        case .switching, .recovering: return "arrow.left.arrow.right"
-        case .controlling, .controlled: return "computermouse.fill"
-        }
-    }
-
-    var statusText: String {
-        switch status {
-        case .local: "本机"
-        case .paused: "已暂停"
-        case .switching: "正在切换…"
-        case .controlling: "正在控制其他设备"
-        case .controlled: "正被其他设备控制"
-        case .recovering: "正在恢复本机控制…"
-        }
+        permissions.accessibility && permissions.postEvents
     }
 
     func refresh() {
+        let wasMissing = !allPermissionsGranted
         permissions = probePermissions()
-        if let s = try? agent.status() { status = s }
+        if wasMissing && allPermissionsGranted && status.captureError != nil {
+            agent.retryCapture()
+        }
+        status = agent.status()
     }
+
+    var connectedPort: PortInfo? {
+        status.ports.first { $0.connected && $0.ipService }
+            ?? status.ports.first { $0.connected }
+    }
+
+    // MARK: Commands
 
     func requestPermissions() {
         OSMCore.requestPermissions()
@@ -61,6 +54,56 @@ final class AppModel {
 
     func openPrivacySettings(_ pane: PrivacyPane) {
         NSWorkspace.shared.open(pane.url)
+    }
+
+    func openNetworkSettings() {
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Network-Settings.extension")!)
+    }
+
+    func setPeerSide(_ side: ScreenSide) { agent.setPeerSide(side: side) }
+    func setSharingEnabled(_ on: Bool) { agent.setSharingEnabled(enabled: on) }
+    func returnToLocal() { agent.returnToLocal() }
+    func retryCapture() { agent.retryCapture() }
+
+    // MARK: Presentation
+
+    var menuBarSymbol: String {
+        if !allPermissionsGranted { return "exclamationmark.triangle" }
+        switch status.role {
+        case .controlling, .controlled: return "computermouse.fill"
+        case .local: return status.link == .connected ? "cable.connector" : "cable.connector.slash"
+        }
+    }
+
+    var linkTitle: String {
+        switch status.link {
+        case .noCable: "未连接雷雳数据线"
+        case .cableNoNetwork: "已连接数据线，网络未就绪"
+        case .searching: "已连接数据线，等待对方启动 OpenShareMouse"
+        case .connecting: "正在连接…"
+        case .connected: "已连接"
+        }
+    }
+
+    var linkColor: NSColor {
+        switch status.link {
+        case .noCable: .systemGray
+        case .cableNoNetwork: .systemOrange
+        case .searching, .connecting: .systemYellow
+        case .connected: .systemGreen
+        }
+    }
+
+    var roleTitle: String {
+        switch status.role {
+        case .local: "正在使用本机"
+        case .controlling: "正在控制 \(peerName)"
+        case .controlled: "正被 \(peerName) 控制"
+        }
+    }
+
+    var peerName: String {
+        status.peer?.name ?? connectedPort?.deviceName ?? "另一台电脑"
     }
 }
 

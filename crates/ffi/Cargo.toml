@@ -14,12 +14,12 @@ crate-type = ["staticlib", "lib"]
 name = "osm_ffi"
 
 [dependencies]
+osm-agent.workspace = true
 osm-core.workspace = true
 osm-model.workspace = true
 osm-platform-macos.workspace = true
 osm-protocol.workspace = true
 osm-transport.workspace = true
-thiserror.workspace = true
 uniffi.workspace = true
 
 [lints]

@@ -1,0 +1,20 @@
+[package]
+name = "osm-agent"
+description = "Two-machine sharing engine: Thunderbolt link supervision, peer session, input routing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+osm-core.workspace = true
+osm-model.workspace = true
+osm-platform-macos.workspace = true
+osm-protocol.workspace = true
+osm-transport.workspace = true
+tracing.workspace = true
+libc.workspace = true
+
+[lints]
+workspace = true

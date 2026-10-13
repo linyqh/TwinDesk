@@ -1,147 +1,117 @@
-// OSM/1 wire schema (report §7.4). Draft: message numbers and fields are
-// frozen in P1, until then anything here may change without notice.
+// OSM/1 wire schema, v1 scope: two Macs over a Thunderbolt Bridge cable.
+// Message numbers may still change until the protocol is frozen.
 syntax = "proto3";
 
 package osm.v1;
 
-// Every reliable frame is `u32_be length + Envelope`. TLS/QUIC authenticate
-// the link; the receiver still validates length, enums, state and capability.
+// UDP discovery beacon, broadcast on the Thunderbolt Bridge once a second.
+// Sent bare (no length prefix).
+message Beacon {
+  // Always BEACON_MAGIC; filters stray datagrams that happen to decode.
+  fixed32 magic = 1;
+  uint32 protocol_major = 2;
+  uint64 device_id = 3;
+  string name = 4;
+  uint32 tcp_port = 5;
+}
+
+// Every TCP frame is `u32_be length + Envelope`.
 message Envelope {
   uint32 protocol_major = 1;
   uint32 protocol_minor = 2;
-  uint64 request_id = 3;
-  uint64 session_id = 4;
-  uint64 boot_id = 5;
-  optional uint64 lease_epoch = 6;
-  optional uint64 topology_revision = 7;
 
   oneof payload {
     Hello hello = 16;
     Ping ping = 17;
-    Error error = 18;
+    Pong pong = 18;
 
-    LeasePrepare lease_prepare = 48;
-    LeaseReady lease_ready = 49;
-    LeaseCommit lease_commit = 50;
-    LeaseActive lease_active = 51;
-    LeaseHeartbeat lease_heartbeat = 52;
-    LeaseRelease lease_release = 53;
-    LeaseReleased lease_released = 54;
+    Enter enter = 32;
+    Leave leave = 33;
 
-    KeyEvent key = 64;
-    ButtonEvent button = 65;
-    WheelEvent wheel = 66;
-    ReleaseAll release_all = 67;
+    MouseMove mouse_move = 48;
+    MouseButton mouse_button = 49;
+    Scroll scroll = 50;
+    Key key = 51;
   }
 }
 
-// 0x01xx: session
 message Hello {
-  string display_name = 1;
-  // Feature bitmap for minor-version negotiation; never compare app versions.
-  uint64 features = 2;
-  repeated Capability capabilities = 3;
-}
-
-message Capability {
-  string name = 1;
-  uint32 version = 2;
-  CapabilityState state = 3;
-  string reason = 4;
-}
-
-enum CapabilityState {
-  CAPABILITY_STATE_UNSPECIFIED = 0;
-  CAPABILITY_STATE_AVAILABLE = 1;
-  CAPABILITY_STATE_PERMISSION_REQUIRED = 2;
-  CAPABILITY_STATE_UNSUPPORTED = 3;
-  CAPABILITY_STATE_TEMPORARILY_UNAVAILABLE = 4;
-  CAPABILITY_STATE_EXPERIMENTAL = 5;
+  uint64 device_id = 1;
+  string name = 2;
+  string model = 3;
+  string os_version = 4;
 }
 
 message Ping {
   uint64 nonce = 1;
 }
 
-message Error {
-  ErrorCode code = 1;
-  string detail = 2;
+message Pong {
+  uint64 nonce = 1;
 }
 
-enum ErrorCode {
-  ERROR_CODE_UNSPECIFIED = 0;
-  ERROR_CODE_UNSUPPORTED = 1;
-  ERROR_CODE_BUSY = 2;
-  ERROR_CODE_STALE_EPOCH = 3;
-  ERROR_CODE_NOT_AUTHORIZED = 4;
-  ERROR_CODE_BAD_STATE = 5;
+enum Side {
+  SIDE_UNSPECIFIED = 0;
+  SIDE_LEFT = 1;
+  SIDE_RIGHT = 2;
 }
 
-// 0x03xx: control lease
-message LeasePrepare {
-  string target_display_id = 1;
-  // Entry point inside the target display, normalized to [0, 1).
-  double entry_x = 2;
-  double entry_y = 3;
+// Controller -> target: "you are controlled from now on". The target warps
+// its cursor just inside `return_side` at `y_ratio` of its desktop height.
+message Enter {
+  uint64 epoch = 1;
+  Side return_side = 2;
+  double y_ratio = 3;
 }
 
-message LeaseReady {
-  uint32 reservation_ttl_ms = 1;
+enum LeaveReason {
+  LEAVE_REASON_UNSPECIFIED = 0;
+  // Target: the cursor was pushed out through the return edge.
+  LEAVE_REASON_EDGE = 1;
+  // Target: someone used the target's own keyboard or mouse.
+  LEAVE_REASON_LOCAL_INPUT = 2;
+  // Controller: emergency hotkey, tap failure or sharing disabled.
+  LEAVE_REASON_ABORT = 3;
+  // Target: busy or sharing disabled, Enter refused.
+  LEAVE_REASON_REJECTED = 4;
 }
 
-message LeaseCommit {}
-
-message LeaseActive {}
-
-message LeaseHeartbeat {
-  uint64 sequence = 1;
+// Either direction: control for `epoch` is over. The target releases every
+// key and button it injected; the controller restores its own cursor.
+message Leave {
+  uint64 epoch = 1;
+  double y_ratio = 2;
+  LeaveReason reason = 3;
 }
 
-message LeaseRelease {}
-
-message LeaseReleased {}
-
-// 0x04xx: input. Key/button/wheel ride the per-lease reliable stream; pointer
-// positions go out as datagrams (see PointerSample) fenced by reliable_seq.
-message KeyEvent {
-  uint64 reliable_seq = 1;
-  // HID usage page and usage; native codes are adapter-side only.
-  uint32 usage_page = 2;
-  uint32 usage = 3;
-  bool down = 4;
-  bool repeat = 5;
-  uint32 modifiers = 6;
+// Raw mouse deltas in points.
+message MouseMove {
+  int32 dx = 1;
+  int32 dy = 2;
 }
 
-message ButtonEvent {
-  uint64 reliable_seq = 1;
-  uint32 button = 2;
-  bool down = 3;
-  // Position at the moment of the click, so it cannot land elsewhere.
-  string display_id = 4;
-  double x = 5;
-  double y = 6;
+message MouseButton {
+  // 0 left, 1 right, 2+ other (CGMouseButton numbering).
+  uint32 button = 1;
+  bool down = 2;
+  int64 click_state = 3;
+  uint64 flags = 4;
 }
 
-message WheelEvent {
-  uint64 reliable_seq = 1;
-  double delta_x = 2;
-  double delta_y = 3;
-  bool precise = 4;
-  uint32 phase = 5;
+message Scroll {
+  // Trackpad / precise scrolling in points; otherwise wheel lines.
+  bool continuous = 1;
+  int32 delta_y = 2;
+  int32 delta_x = 3;
+  uint32 scroll_phase = 4;
+  uint32 momentum_phase = 5;
 }
 
-message ReleaseAll {
-  uint64 reliable_seq = 1;
-}
-
-// Sent as a QUIC datagram, not inside Envelope framing.
-message PointerSample {
-  uint64 lease_epoch = 1;
-  uint64 sample_seq = 2;
-  // Newest reliable event this sample depends on.
-  uint64 reliable_seq_fence = 3;
-  string display_id = 4;
-  double x = 5;
-  double y = 6;
+// macOS virtual keycode. Mac <-> Mac only in v1; a portable HID mapping comes
+// with the Windows adapter.
+message Key {
+  uint32 keycode = 1;
+  bool down = 2;
+  bool repeat = 3;
+  uint64 flags = 4;
 }

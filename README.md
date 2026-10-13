@@ -4,7 +4,29 @@
 
 产品规格、架构和验收基线见 [ShareMouse-Professional-Reconstruction.md](ShareMouse-Professional-Reconstruction.md)（下文简称“报告”）。
 
-**状态：骨架阶段。** 目前只能构建、签名并启动一个菜单栏应用，显示权限状态。还不能共享键鼠。
+**状态：v1。** 两台 Mac 通过一根雷雳数据线共用一套键盘鼠标。
+
+## v1 功能
+
+- 检测本机雷雳端口：哪个端口接了设备、链路速率、对端是什么电脑、是否支持雷雳网络。
+- 检测“雷雳网桥”（`bridge0`）是否启用、是否有地址。
+- 两台 Mac 上都运行本应用后，通过雷雳网桥自动发现对方并连接。只走雷雳数据线，不经过 Wi-Fi。
+- 把鼠标移出屏幕边缘（左或右，可设置）就会切到对方电脑，键盘随之跟过去。从对方屏幕的相对一侧移回来，就回到本机。
+- 安全退出：
+  - 按 ⌃⌘⎋（Control-Command-Esc）立即回到本机。
+  - 拔掉数据线或对方超过 3 秒无响应时，自动回到本机，并松开对方电脑上被按住的键。
+  - 被控制的电脑上有人点击、按键或滚动时，立即收回控制权。
+- 主窗口显示数据线状态、端口信息、对方电脑信息、延迟和当前控制状态。
+
+v1 不包含剪贴板、文件传输、多台电脑、Windows。**v1 的连接没有加密，也没有配对验证**：雷雳网桥上任何运行本应用的电脑都能连上来。只在你自己控制的两台电脑之间使用。
+
+## 使用方法
+
+1. 用雷雳 / USB4 数据线连接两台 Mac。
+2. 两台电脑都打开“系统设置 > 网络”，确认“雷雳网桥”已启用（默认就是启用的，地址会自动分配为 169.254.x.x）。
+3. 两台电脑都运行 OpenShareMouse，并在“系统设置 > 隐私与安全性 > 辅助功能”里允许它。授权后点窗口里的“重试”，或重新打开应用。
+4. 窗口显示“已连接”后，在“对方电脑位于本机的”里选择左侧或右侧，两台电脑要选相反的方向。
+5. 把鼠标推出那一侧的屏幕边缘即可。
 
 ## 架构
 
@@ -14,11 +36,12 @@ OpenShareMouse.app（菜单栏应用，单进程）
 │     ↕ UniFFI，仅控制面（crates/ffi）
 └─ Rust 静态库
    ├─ osm-model           ID、能力、几何、布局档案（报告 §5）
-   ├─ osm-core            控制租约状态机、拓扑、输入路由，sans-IO（§6）
-   ├─ osm-protocol        OSM/1 protobuf schema 与封帧（§7.4）
-   ├─ osm-transport       QUIC/TLS、发现（§7.1–7.3，待实现）
-   ├─ osm-transfer        剪贴板 offer、文件传输、路径校验（§9–10）
-   └─ osm-platform-macos  权限探针、event tap 捕获与注入（§17.2）
+   ├─ osm-agent           引擎：数据线监测、对方连接、输入路由（router.rs 是纯逻辑，可单测）
+   ├─ osm-core            屏幕边缘几何、按键规则，sans-IO
+   ├─ osm-protocol        OSM/1 protobuf schema、封帧、发现广播
+   ├─ osm-transport       雷雳网桥上的 UDP 发现与 TCP 连接（绑定 bridge0）
+   ├─ osm-transfer        文件传输路径校验（v1 未使用）
+   └─ osm-platform-macos  雷雳检测、权限探针、event tap 捕获与注入、光标控制
 ```
 
 输入热路径（event tap 回调、本机屏蔽、事件注入）放在 Rust 里，不经过 FFI。理由见 [docs/adr/0001-input-hot-path-in-rust.md](docs/adr/0001-input-hot-path-in-rust.md)。
@@ -32,6 +55,7 @@ make app          # 构建 Rust 和 Swift，打包并签名 build/app/OpenShareM
 make run          # 构建后启动
 make test         # Rust 测试 + Swift 绑定测试
 make lint         # rustfmt + clippy
+cargo run -p osm-agent --example status   # 在终端打印雷雳检测结果
 ```
 
 `make app` 实际依次执行：
