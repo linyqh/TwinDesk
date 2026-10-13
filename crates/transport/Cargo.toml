@@ -1,0 +1,16 @@
+[package]
+name = "osm-transport"
+description = "QUIC/TLS transport, discovery and connection lifecycle (report §7.1–7.3)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# quinn, rustls and rcgen are added with NET-01; keeping the skeleton free of
+# them keeps first builds fast and offline-friendly.
+[dependencies]
+osm-protocol.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,4 @@
+[bindings.swift]
+module_name = "OSMCore"
+ffi_module_name = "OSMCoreFFI"
+generate_immutable_records = true

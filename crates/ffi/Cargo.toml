@@ -1,0 +1,26 @@
+[package]
+name = "osm-ffi"
+description = "UniFFI surface consumed by the Swift app (control plane only, never the input hot path)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# staticlib is linked into the app through the xcframework; `lib` keeps
+# `cargo test` and the bindgen metadata extraction working.
+crate-type = ["staticlib", "lib"]
+name = "osm_ffi"
+
+[dependencies]
+osm-core.workspace = true
+osm-model.workspace = true
+osm-platform-macos.workspace = true
+osm-protocol.workspace = true
+osm-transport.workspace = true
+thiserror.workspace = true
+uniffi.workspace = true
+
+[lints]
+workspace = true

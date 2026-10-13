@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Developer ID distribution, Hardened Runtime, no App Sandbox: event
+     injection and filtering taps are not viable inside the sandbox or on the
+     Mac App Store. Add entitlements only when a feature proves it needs one. -->
+<plist version="1.0">
+<dict>
+</dict>
+</plist>

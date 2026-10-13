@@ -1,0 +1,7 @@
+# "stable" rather than an exact version: pinning makes rustup fetch a separate
+# channel manifest, which times out on flaky networks. MSRV is enforced by
+# `rust-version` in Cargo.toml instead.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+targets = ["aarch64-apple-darwin"]

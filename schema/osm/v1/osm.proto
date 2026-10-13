@@ -1,0 +1,147 @@
+// OSM/1 wire schema (report §7.4). Draft: message numbers and fields are
+// frozen in P1, until then anything here may change without notice.
+syntax = "proto3";
+
+package osm.v1;
+
+// Every reliable frame is `u32_be length + Envelope`. TLS/QUIC authenticate
+// the link; the receiver still validates length, enums, state and capability.
+message Envelope {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  uint64 request_id = 3;
+  uint64 session_id = 4;
+  uint64 boot_id = 5;
+  optional uint64 lease_epoch = 6;
+  optional uint64 topology_revision = 7;
+
+  oneof payload {
+    Hello hello = 16;
+    Ping ping = 17;
+    Error error = 18;
+
+    LeasePrepare lease_prepare = 48;
+    LeaseReady lease_ready = 49;
+    LeaseCommit lease_commit = 50;
+    LeaseActive lease_active = 51;
+    LeaseHeartbeat lease_heartbeat = 52;
+    LeaseRelease lease_release = 53;
+    LeaseReleased lease_released = 54;
+
+    KeyEvent key = 64;
+    ButtonEvent button = 65;
+    WheelEvent wheel = 66;
+    ReleaseAll release_all = 67;
+  }
+}
+
+// 0x01xx: session
+message Hello {
+  string display_name = 1;
+  // Feature bitmap for minor-version negotiation; never compare app versions.
+  uint64 features = 2;
+  repeated Capability capabilities = 3;
+}
+
+message Capability {
+  string name = 1;
+  uint32 version = 2;
+  CapabilityState state = 3;
+  string reason = 4;
+}
+
+enum CapabilityState {
+  CAPABILITY_STATE_UNSPECIFIED = 0;
+  CAPABILITY_STATE_AVAILABLE = 1;
+  CAPABILITY_STATE_PERMISSION_REQUIRED = 2;
+  CAPABILITY_STATE_UNSUPPORTED = 3;
+  CAPABILITY_STATE_TEMPORARILY_UNAVAILABLE = 4;
+  CAPABILITY_STATE_EXPERIMENTAL = 5;
+}
+
+message Ping {
+  uint64 nonce = 1;
+}
+
+message Error {
+  ErrorCode code = 1;
+  string detail = 2;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_UNSUPPORTED = 1;
+  ERROR_CODE_BUSY = 2;
+  ERROR_CODE_STALE_EPOCH = 3;
+  ERROR_CODE_NOT_AUTHORIZED = 4;
+  ERROR_CODE_BAD_STATE = 5;
+}
+
+// 0x03xx: control lease
+message LeasePrepare {
+  string target_display_id = 1;
+  // Entry point inside the target display, normalized to [0, 1).
+  double entry_x = 2;
+  double entry_y = 3;
+}
+
+message LeaseReady {
+  uint32 reservation_ttl_ms = 1;
+}
+
+message LeaseCommit {}
+
+message LeaseActive {}
+
+message LeaseHeartbeat {
+  uint64 sequence = 1;
+}
+
+message LeaseRelease {}
+
+message LeaseReleased {}
+
+// 0x04xx: input. Key/button/wheel ride the per-lease reliable stream; pointer
+// positions go out as datagrams (see PointerSample) fenced by reliable_seq.
+message KeyEvent {
+  uint64 reliable_seq = 1;
+  // HID usage page and usage; native codes are adapter-side only.
+  uint32 usage_page = 2;
+  uint32 usage = 3;
+  bool down = 4;
+  bool repeat = 5;
+  uint32 modifiers = 6;
+}
+
+message ButtonEvent {
+  uint64 reliable_seq = 1;
+  uint32 button = 2;
+  bool down = 3;
+  // Position at the moment of the click, so it cannot land elsewhere.
+  string display_id = 4;
+  double x = 5;
+  double y = 6;
+}
+
+message WheelEvent {
+  uint64 reliable_seq = 1;
+  double delta_x = 2;
+  double delta_y = 3;
+  bool precise = 4;
+  uint32 phase = 5;
+}
+
+message ReleaseAll {
+  uint64 reliable_seq = 1;
+}
+
+// Sent as a QUIC datagram, not inside Envelope framing.
+message PointerSample {
+  uint64 lease_epoch = 1;
+  uint64 sample_seq = 2;
+  // Newest reliable event this sample depends on.
+  uint64 reliable_seq_fence = 3;
+  string display_id = 4;
+  double x = 5;
+  double y = 6;
+}

@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>zh-Hans</string>
+	<key>CFBundleDisplayName</key>
+	<string>OpenShareMouse</string>
+	<key>CFBundleExecutable</key>
+	<string>OpenShareMouse</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(BUNDLE_ID)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>OpenShareMouse</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(BUILD_NUMBER)</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.utilities</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<!-- Menu bar agent: no Dock icon, no main window. -->
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string></string>
+	<!-- macOS 15+ local network privacy: without these keys discovery and
+	     LAN connections can be denied silently, with no prompt (TN3179). -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>OpenShareMouse 需要访问本地网络，以发现并连接同一局域网中的其他电脑，共享键盘、鼠标和剪贴板。</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_opensharemouse._udp</string>
+	</array>
+</dict>
+</plist>
