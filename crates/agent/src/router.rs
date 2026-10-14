@@ -39,8 +39,12 @@ pub enum Effect {
     BeginControlled {
         at: LogicalPoint,
     },
-    /// Release everything injected and return to local mode.
-    EndControlled,
+    /// Release everything injected and return to local mode. `handoff` is
+    /// set when the cursor left through the return edge, so a drag in
+    /// progress continues on the peer; otherwise the session was aborted.
+    EndControlled {
+        handoff: bool,
+    },
     InjectMove {
         to: LogicalPoint,
         dx: i32,
@@ -80,6 +84,8 @@ pub struct Router {
     sharing_enabled: bool,
     /// Turns the locally remapped Fn key back into Fn for the peer.
     fn_restore: FnRestore,
+    /// Epoch of the most recent session in either role.
+    last_epoch: u64,
 }
 
 impl Router {
@@ -94,7 +100,18 @@ impl Router {
             remote_pos: center,
             sharing_enabled: true,
             fn_restore: FnRestore::default(),
+            last_epoch: 0,
         }
+    }
+
+    /// Where the local cursor is parked while forwarding.
+    pub fn park(&self) -> LogicalPoint {
+        self.park
+    }
+
+    /// Epoch of the current or most recently ended session.
+    pub fn last_epoch(&self) -> u64 {
+        self.last_epoch
     }
 
     pub fn role(&self) -> Role {
@@ -140,7 +157,7 @@ impl Router {
             Role::Controlled { epoch } => {
                 self.role = Role::Local;
                 vec![
-                    Effect::EndControlled,
+                    Effect::EndControlled { handoff: false },
                     Effect::Send(leave(epoch, 0.5, LeaveReason::LocalInput)),
                 ]
             }
@@ -152,7 +169,7 @@ impl Router {
         let fx = match self.role {
             Role::Local => Vec::new(),
             Role::Controlling { .. } => vec![Effect::EndForwarding { at: self.park }],
-            Role::Controlled { .. } => vec![Effect::EndControlled],
+            Role::Controlled { .. } => vec![Effect::EndControlled { handoff: false }],
         };
         self.role = Role::Local;
         fx
@@ -171,6 +188,7 @@ impl Router {
                 let epoch = self.next_epoch;
                 self.next_epoch += 1;
                 self.role = Role::Controlling { epoch };
+                self.last_epoch = epoch;
                 self.fn_restore.reset();
                 self.park = self
                     .desktop
@@ -278,6 +296,7 @@ impl Router {
                 // edge we consider to face the peer.
                 self.peer_side = side;
                 self.role = Role::Controlled { epoch: e.epoch };
+                self.last_epoch = e.epoch;
                 self.remote_pos = self.desktop.entry_point(side, e.y_ratio);
                 vec![Effect::BeginControlled {
                     at: self.remote_pos,
@@ -298,7 +317,7 @@ impl Router {
             }
             (Role::Controlled { epoch }, P::Leave(l)) if l.epoch == epoch => {
                 self.role = Role::Local;
-                vec![Effect::EndControlled]
+                vec![Effect::EndControlled { handoff: false }]
             }
 
             (Role::Controlled { epoch }, P::MouseMove(m)) => {
@@ -309,9 +328,12 @@ impl Router {
                 if self.desktop.beyond_edge(self.peer_side, raw) {
                     let y_ratio = self.desktop.y_ratio(raw);
                     self.role = Role::Local;
+                    // Leave first: a drag carried across is offered while
+                    // handling EndControlled, and the peer must already be
+                    // local when the offer arrives.
                     return vec![
-                        Effect::EndControlled,
                         Effect::Send(leave(epoch, y_ratio, LeaveReason::Edge)),
+                        Effect::EndControlled { handoff: true },
                     ];
                 }
                 self.remote_pos = self.desktop.clamp(raw);
@@ -401,6 +423,7 @@ mod tests {
             pos: pt(999.0, 400.0),
             dx: 5.0,
             dy: 0.0,
+            left_down: false,
         });
         let Role::Controlling { epoch } = r.role() else {
             panic!("not controlling: {fx:?}")
@@ -415,6 +438,7 @@ mod tests {
             pos: pt(999.0, 200.0),
             dx: 3.0,
             dy: 0.0,
+            left_down: false,
         });
         assert!(matches!(fx[0], Effect::BeginForwarding { .. }));
         let Effect::Send(P::Enter(e)) = &fx[1] else {
@@ -431,7 +455,8 @@ mod tests {
             r.on_local(InputEvent::LocalMove {
                 pos: pt(0.0, 200.0),
                 dx: -3.0,
-                dy: 0.0
+                dy: 0.0,
+                left_down: false,
             })
             .is_empty()
         );
@@ -439,7 +464,8 @@ mod tests {
             r.on_local(InputEvent::LocalMove {
                 pos: pt(999.0, 200.0),
                 dx: -3.0,
-                dy: 0.0
+                dy: 0.0,
+                left_down: false,
             })
             .is_empty()
         );
@@ -454,10 +480,22 @@ mod tests {
             r.on_local(InputEvent::LocalMove {
                 pos: pt(999.0, 200.0),
                 dx: 3.0,
-                dy: 0.0
+                dy: 0.0,
+                left_down: false,
             })
             .is_empty()
         );
+    }
+
+    #[test]
+    fn epochs_are_remembered_after_sessions_end() {
+        let mut r = Router::new(desktop(), Side::Right);
+        let epoch = start_controlling(&mut r);
+        r.abort();
+        assert_eq!(r.last_epoch(), epoch);
+        let mut r = controlled(v1::Side::Left);
+        r.abort();
+        assert_eq!(r.last_epoch(), 9);
     }
 
     #[test]
@@ -597,10 +635,10 @@ mod tests {
         // Pushing back through the left edge hands control back.
         let fx = r.on_peer(P::MouseMove(v1::MouseMove { dx: -1000, dy: 0 }));
         assert_eq!(r.role(), Role::Local);
-        assert!(matches!(fx[0], Effect::EndControlled));
         assert!(
-            matches!(&fx[1], Effect::Send(P::Leave(l)) if l.reason == LeaveReason::Edge as i32)
+            matches!(&fx[0], Effect::Send(P::Leave(l)) if l.reason == LeaveReason::Edge as i32)
         );
+        assert!(matches!(fx[1], Effect::EndControlled { handoff: true }));
     }
 
     #[test]
@@ -608,7 +646,7 @@ mod tests {
         let mut r = controlled(v1::Side::Left);
         let fx = r.on_local(InputEvent::LocalActivity);
         assert_eq!(r.role(), Role::Local);
-        assert!(matches!(fx[0], Effect::EndControlled));
+        assert!(matches!(fx[0], Effect::EndControlled { handoff: false }));
     }
 
     #[test]
@@ -628,7 +666,10 @@ mod tests {
     #[test]
     fn disconnect_recovers_without_sending() {
         let mut r = controlled(v1::Side::Left);
-        assert_eq!(r.disconnected(), vec![Effect::EndControlled]);
+        assert_eq!(
+            r.disconnected(),
+            vec![Effect::EndControlled { handoff: false }]
+        );
         let mut r = Router::new(desktop(), Side::Right);
         start_controlling(&mut r);
         let fx = r.disconnected();

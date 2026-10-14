@@ -71,6 +71,35 @@ pub fn validate_relative_path(path: &str) -> Result<Vec<&str>, PathError> {
     Ok(components)
 }
 
+/// Validates a manifest path that this Mac will create. Unlike
+/// [`validate_relative_path`] it only rejects what could escape the
+/// destination or what APFS/HFS+ cannot store, so ordinary Mac names such as
+/// `a?b.txt` or Finder's `Icon\r` survive a Mac-to-Mac copy.
+pub fn validate_macos_path(path: &str) -> Result<Vec<&str>, PathError> {
+    if path.is_empty() {
+        return Err(PathError::Empty);
+    }
+    if path.starts_with('/') {
+        return Err(PathError::Absolute);
+    }
+    let components: Vec<&str> = path.split('/').collect();
+    if components.len() > MAX_DEPTH {
+        return Err(PathError::TooDeep);
+    }
+    for c in &components {
+        if c.is_empty() || *c == "." || *c == ".." {
+            return Err(PathError::Traversal);
+        }
+        if c.contains('\0') {
+            return Err(PathError::ControlChar);
+        }
+        if c.len() > MAX_COMPONENT_BYTES {
+            return Err(PathError::ComponentTooLong);
+        }
+    }
+    Ok(components)
+}
+
 fn has_drive_prefix(path: &str) -> bool {
     let b = path.as_bytes();
     b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
@@ -137,6 +166,30 @@ mod tests {
         }
         assert!(validate_relative_path("COM0").is_ok());
         assert!(validate_relative_path("console.txt").is_ok());
+    }
+
+    #[test]
+    fn macos_rules_keep_mac_names_but_block_escapes() {
+        for ok in [
+            "a?b.txt",
+            "Folder/Icon\r",
+            "x:y",
+            "COM1",
+            "trailing.",
+            "a\\b",
+        ] {
+            assert!(validate_macos_path(ok).is_ok(), "{ok:?}");
+        }
+        assert_eq!(validate_macos_path(""), Err(PathError::Empty));
+        assert_eq!(validate_macos_path("/etc"), Err(PathError::Absolute));
+        for bad in ["../x", "a/../../x", "a//b", "./a", "a/"] {
+            assert_eq!(validate_macos_path(bad), Err(PathError::Traversal), "{bad}");
+        }
+        assert_eq!(validate_macos_path("a\0b"), Err(PathError::ControlChar));
+        let long = "x".repeat(MAX_COMPONENT_BYTES + 1);
+        assert_eq!(validate_macos_path(&long), Err(PathError::ComponentTooLong));
+        let deep = vec!["d"; MAX_DEPTH + 1].join("/");
+        assert_eq!(validate_macos_path(&deep), Err(PathError::TooDeep));
     }
 
     #[test]

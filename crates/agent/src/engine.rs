@@ -18,21 +18,53 @@ use std::time::{Duration, Instant};
 
 use osm_core::{Desktop, Side};
 use osm_platform_macos::{
-    Capture, CaptureMode, CursorLock, FnRemap, Injector, InputEvent, ThunderboltStatus,
-    display_rects,
+    Capture, CaptureMode, CursorLock, DragPasteboard, FnRemap, Injector, InputEvent,
+    ThunderboltStatus, UntrackedLeft, cursor_position, display_rects, physical_left_down,
 };
 use osm_protocol::envelope;
 use osm_protocol::v1::{self, envelope::Payload};
 use osm_transport::{DiscoveredPeer, FrameReader, FrameWriter, ReadError, tune};
 
+use crate::drag::{DragCoordinator, DragEffect, Driver, PreparedOffer, Probe};
 use crate::link;
 use crate::router::{Effect, Role, Router};
+use crate::transfers::Transfers;
 
 const PING_INTERVAL: Duration = Duration::from_millis(500);
 /// No traffic from the peer for this long ends the session. This bounds how
 /// long injected keys can stay held if the cable is pulled mid-keystroke.
 const PEER_TIMEOUT: Duration = Duration::from_secs(3);
 const TICK: Duration = Duration::from_millis(100);
+/// How long the UI gets to put up a shield or pickup panel before the drag
+/// is cancelled instead (D: panels appear in well under 100 ms).
+const OVERLAY_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Lets the window server deliver a release to the shield before the
+/// shield disappears from under it (D).
+const SHIELD_LINGER: Duration = Duration::from_millis(250);
+/// Items in one drag offer; more would not fit in a control frame (D).
+const MAX_DRAG_ITEMS: usize = 256;
+
+/// Panels the engine asks the UI to show. Implemented in Swift; every call
+/// comes from the engine thread and must return without blocking on it.
+pub trait DragUi: Send + Sync {
+    /// Show an invisible panel at `at` (Quartz points) that refuses drops.
+    /// Report back with [`Command::OverlayReady`].
+    fn show_shield(&self, request: u64, x: f64, y: f64);
+    fn hide_shield(&self, request: u64);
+    /// Show an invisible panel at `at`; the next left press on it starts a
+    /// native drag of file promises for `items`. Report readiness with
+    /// [`Command::OverlayReady`] and the end of the drag with
+    /// [`Command::ProxyEnded`].
+    fn begin_proxy(&self, request: u64, drag_id: u64, items: Vec<DragItemInfo>, x: f64, y: f64);
+    fn end_proxy(&self, drag_id: u64);
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DragItemInfo {
+    pub name: String,
+    pub is_directory: bool,
+    pub size: u64,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkState {
@@ -76,6 +108,13 @@ pub enum Command {
     ReturnToLocal,
     /// Try to create the event tap again, e.g. after granting permission.
     RetryCapture,
+    /// The UI put up the panel for an overlay request.
+    OverlayReady(u64),
+    /// The proxy drag for `drag_id` ended; `dropped` if a target took it.
+    ProxyEnded {
+        drag_id: u64,
+        dropped: bool,
+    },
 }
 
 pub(crate) enum Msg {
@@ -111,6 +150,7 @@ pub struct Engine {
     status: Arc<Mutex<Status>>,
     running: Arc<AtomicBool>,
     threads: Vec<thread::JoinHandle<()>>,
+    transfers: Transfers,
 }
 
 impl std::fmt::Debug for Msg {
@@ -120,7 +160,7 @@ impl std::fmt::Debug for Msg {
 }
 
 impl Engine {
-    pub fn start(device_name: String) -> Self {
+    pub fn start(device_name: String, ui: Option<Arc<dyn DragUi>>) -> Self {
         let device_id = random_u64();
         let (tx, rx) = channel();
         let running = Arc::new(AtomicBool::new(true));
@@ -144,10 +184,22 @@ impl Engine {
         )];
         let engine_tx = tx.clone();
         let engine_status = status.clone();
+        let transfers = Transfers::new();
+        let engine_transfers = transfers.clone();
         threads.push(
             thread::Builder::new()
                 .name("osm-engine".into())
-                .spawn(move || State::new(engine_tx, engine_status, device_id, device_name).run(rx))
+                .spawn(move || {
+                    State::new(
+                        engine_tx,
+                        engine_status,
+                        device_id,
+                        device_name,
+                        engine_transfers,
+                        ui,
+                    )
+                    .run(rx)
+                })
                 .expect("spawn engine thread"),
         );
         Self {
@@ -155,7 +207,13 @@ impl Engine {
             status,
             running,
             threads,
+            transfers,
         }
+    }
+
+    /// File transfers started by drag and drop. Safe to use from any thread.
+    pub fn transfers(&self) -> &Transfers {
+        &self.transfers
     }
 
     pub fn status(&self) -> Status {
@@ -170,6 +228,7 @@ impl Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
+        self.transfers.cancel_all();
         let _ = self.tx.send(Msg::Shutdown);
         for t in self.threads.drain(..) {
             let _ = t.join();
@@ -184,6 +243,10 @@ struct Connection {
     last_seen: Instant,
     last_ping: Instant,
     ping_sent: Option<(u64, Instant)>,
+    /// Bulk listener port announced to the peer for this connection.
+    bulk_port: Option<u16>,
+    /// Peer understands drag-and-drop messages (protocol minor >= 1).
+    drag_capable: bool,
 }
 
 struct State {
@@ -208,6 +271,17 @@ struct State {
     last_error: Option<String>,
     round_trip: Option<Duration>,
     sharing_enabled: bool,
+
+    transfers: Transfers,
+    ui: Option<Arc<dyn DragUi>>,
+    drag: DragCoordinator,
+    drag_pb: Option<DragPasteboard>,
+    /// Physical left button state as seen by the tap in Local mode.
+    left_down: bool,
+    /// Drag pasteboard was rewritten since the current press began.
+    drag_started: bool,
+    overlay_deadlines: Vec<(u64, Instant)>,
+    shield_hides: Vec<(u64, Instant)>,
 }
 
 impl State {
@@ -216,6 +290,8 @@ impl State {
         status: Arc<Mutex<Status>>,
         device_id: u64,
         device_name: String,
+        transfers: Transfers,
+        ui: Option<Arc<dyn DragUi>>,
     ) -> Self {
         let desktop = current_desktop();
         let mut s = Self {
@@ -238,6 +314,18 @@ impl State {
             last_error: None,
             round_trip: None,
             sharing_enabled: true,
+            transfers,
+            drag_pb: if ui.is_some() {
+                DragPasteboard::open()
+            } else {
+                None
+            },
+            ui,
+            drag: DragCoordinator::new(),
+            left_down: false,
+            drag_started: false,
+            overlay_deadlines: Vec::new(),
+            shield_hides: Vec::new(),
         };
         // A crash while forwarding would leave Fn remapped; undo that first.
         let stale = FnRemap::clear_stale();
@@ -293,6 +381,9 @@ impl State {
         // Leave both machines usable.
         let fx = self.router.abort();
         self.apply(fx);
+        let fx = self.drag.reset(cursor_position());
+        self.apply_drag(fx);
+        self.transfers.disconnected();
         self.injector.release_all();
         self.fn_remap.release();
         self.cursor.unlock(None);
@@ -303,10 +394,7 @@ impl State {
 
     fn handle(&mut self, msg: Msg) {
         match msg {
-            Msg::Input(ev) => {
-                let fx = self.router.on_local(ev);
-                self.apply(fx);
-            }
+            Msg::Input(ev) => self.on_input(ev),
             Msg::Link { status, net_error } => {
                 let had_peer = self.thunderbolt.connected_peer().is_some();
                 self.thunderbolt = status;
@@ -358,8 +446,236 @@ impl State {
                 self.start_capture();
                 Vec::new()
             }
+            Command::OverlayReady(request) => {
+                self.overlay_deadlines.retain(|(r, _)| *r != request);
+                let held = physical_left_down();
+                let fx = self.drag.overlay_ready(request, held);
+                self.apply_drag(fx);
+                Vec::new()
+            }
+            Command::ProxyEnded { drag_id, dropped } => {
+                let fx = self.drag.proxy_ended(drag_id, dropped);
+                self.apply_drag(fx);
+                Vec::new()
+            }
         };
         self.apply(fx);
+    }
+
+    fn on_input(&mut self, ev: InputEvent) {
+        match ev {
+            InputEvent::LocalLeftButton { down } => {
+                self.left_down = down;
+                if down {
+                    // Absorb older drags, so only one begun by this press
+                    // counts at the crossing.
+                    if let Some(pb) = &self.drag_pb {
+                        pb.changed();
+                    }
+                    self.drag_started = false;
+                } else {
+                    let fx = self.drag.physical_left_up_local();
+                    self.apply_drag(fx);
+                }
+                return;
+            }
+            InputEvent::LocalMove { left_down, .. } => {
+                if left_down
+                    && !self.drag_started
+                    && let Some(pb) = &self.drag_pb
+                    && pb.changed()
+                {
+                    self.drag_started = true;
+                }
+                if !left_down && self.left_down {
+                    // Missed the release (e.g. while forwarding).
+                    self.left_down = false;
+                }
+            }
+            InputEvent::Button {
+                button: 0,
+                down: false,
+                ..
+            } if matches!(self.router.role(), Role::Controlling { .. }) => {
+                let fx = self.drag.physical_left_up_forwarding();
+                self.apply_drag(fx);
+            }
+            _ => {}
+        }
+        let before = self.router.role();
+        let fx = self.router.on_local(ev);
+        self.apply(fx);
+        if before == Role::Local
+            && matches!(self.router.role(), Role::Controlling { .. })
+            && self.left_down
+        {
+            self.crossed_out(Driver::Physical);
+        }
+    }
+
+    /// The cursor just left this Mac with the left button held by `driver`.
+    fn crossed_out(&mut self, driver: Driver) {
+        let at = match driver {
+            Driver::Physical => self.router.park(),
+            Driver::Injected => self.injector.position(),
+        };
+        // Carrying our own proxy back: it is cancelled, not offered.
+        let probe = if self.drag.has_proxy() {
+            Probe::NoDrag
+        } else {
+            self.probe_drag(driver)
+        };
+        let fx = self.drag.crossing_out(driver, probe, at);
+        self.apply_drag(fx);
+    }
+
+    fn probe_drag(&mut self, driver: Driver) -> Probe {
+        if self.ui.is_none() || !self.conn.as_ref().is_some_and(|c| c.drag_capable) {
+            return Probe::NoDrag;
+        }
+        let Some(pb) = &self.drag_pb else {
+            return Probe::NoDrag;
+        };
+        let started = match driver {
+            Driver::Physical => std::mem::take(&mut self.drag_started) || pb.changed(),
+            // The injected press happened on this Mac too, so any rewrite
+            // of the drag pasteboard since then is this drag.
+            Driver::Injected => pb.changed(),
+        };
+        if !started {
+            return Probe::NoDrag;
+        }
+        let paths = pb.file_paths();
+        if paths.is_empty() || paths.len() > MAX_DRAG_ITEMS {
+            return Probe::OtherDrag;
+        }
+        let items: Result<Vec<_>, _> = paths
+            .iter()
+            .map(|p| osm_transfer::describe_item(p))
+            .collect();
+        match items {
+            Ok(items) => Probe::Files(PreparedOffer {
+                drag_id: random_u64(),
+                token: random_bytes(),
+                items,
+                paths,
+            }),
+            Err(e) => {
+                tracing::info!("dragged files cannot be offered: {e}");
+                Probe::OtherDrag
+            }
+        }
+    }
+
+    fn apply_drag(&mut self, effects: Vec<DragEffect>) {
+        for fx in effects {
+            match fx {
+                DragEffect::ShowShield { request, at } => {
+                    self.overlay_deadlines
+                        .push((request, Instant::now() + OVERLAY_TIMEOUT));
+                    if let Some(ui) = &self.ui {
+                        ui.show_shield(request, at.x, at.y);
+                    }
+                }
+                DragEffect::HideShield { request } => {
+                    self.overlay_deadlines.retain(|(r, _)| *r != request);
+                    if let Some(ui) = &self.ui {
+                        ui.hide_shield(request);
+                    }
+                }
+                DragEffect::HideShieldSoon { request } => {
+                    self.shield_hides
+                        .push((request, Instant::now() + SHIELD_LINGER));
+                }
+                DragEffect::ReleaseLeft(Driver::Injected) => {
+                    // Zero-length drag first, so the session re-targets the
+                    // shield that just appeared under the cursor.
+                    self.injector.nudge();
+                    self.injector.button(0, false, 1);
+                }
+                // The OS saw the press but its release was forwarded.
+                DragEffect::ReleaseLeft(Driver::Physical) => {
+                    self.injector.post_untracked_left(UntrackedLeft::Drag);
+                    self.injector.post_untracked_left(UntrackedLeft::Up);
+                }
+                DragEffect::PressLeft(Driver::Injected) => {
+                    self.injector.button(0, true, 1);
+                    self.injector.nudge();
+                }
+                // The press was forwarded, so the OS never saw it; the
+                // user's real release later ends this drag normally.
+                DragEffect::PressLeft(Driver::Physical) => {
+                    self.injector.post_untracked_left(UntrackedLeft::Down);
+                    self.injector.post_untracked_left(UntrackedLeft::Drag);
+                }
+                DragEffect::Escape(_) => self.injector.tap_escape(),
+                DragEffect::BeginProxy {
+                    request,
+                    drag_id,
+                    items,
+                    at,
+                } => {
+                    self.overlay_deadlines
+                        .push((request, Instant::now() + OVERLAY_TIMEOUT));
+                    if let Some(ui) = &self.ui {
+                        let items = items
+                            .into_iter()
+                            .map(|i| DragItemInfo {
+                                is_directory: i.kind == v1::EntryKind::Directory as i32,
+                                name: i.name,
+                                size: i.size,
+                            })
+                            .collect();
+                        ui.begin_proxy(request, drag_id, items, at.x, at.y);
+                    }
+                }
+                DragEffect::EndProxy { drag_id } => {
+                    if let Some(ui) = &self.ui {
+                        ui.end_proxy(drag_id);
+                    }
+                }
+                DragEffect::Offer(offer) => self.send_offer(offer),
+                DragEffect::Send(p) => self.send(p),
+            }
+        }
+    }
+
+    fn send_offer(&mut self, offer: PreparedOffer) {
+        let Some(port) = self.conn.as_ref().and_then(|c| c.bulk_port) else {
+            return;
+        };
+        self.transfers
+            .serve(offer.drag_id, offer.token.clone(), offer.paths);
+        self.send(Payload::DragOffer(v1::DragOffer {
+            drag_id: offer.drag_id,
+            epoch: self.router.last_epoch(),
+            token: offer.token,
+            bulk_port: port.into(),
+            items: offer.items,
+        }));
+    }
+
+    fn on_drag_offer(&mut self, offer: v1::DragOffer) {
+        if offer.epoch != self.router.last_epoch() || !self.transfers.offer_received(&offer) {
+            return;
+        }
+        let (driver, at) = match self.router.role() {
+            // The button is held on the peer's mouse; if it is released
+            // before our pickup is ready, the forwarded release aborts.
+            Role::Controlled { .. } => (Driver::Injected, self.injector.position()),
+            // The peer handed the cursor back with a drag in our user's hand.
+            Role::Local if physical_left_down() => (Driver::Physical, cursor_position()),
+            _ => {
+                self.send(Payload::DragEnd(v1::DragEnd {
+                    drag_id: offer.drag_id,
+                    dropped: false,
+                }));
+                return;
+            }
+        };
+        let items = offer.items.into_iter().take(MAX_DRAG_ITEMS).collect();
+        let fx = self.drag.offer_received(offer.drag_id, items, driver, at);
+        self.apply_drag(fx);
     }
 
     /// Lower device id dials, so exactly one TCP connection forms.
@@ -417,6 +733,9 @@ impl State {
             .expect("spawn reader thread");
 
         let now = Instant::now();
+        let bulk_port = self
+            .transfers
+            .connected(*addr.ip(), self.thunderbolt.bridge.index);
         self.conn = Some(Connection {
             id,
             writer: FrameWriter::new(stream),
@@ -424,6 +743,8 @@ impl State {
             last_seen: now,
             last_ping: now,
             ping_sent: None,
+            bulk_port,
+            drag_capable: false,
         });
         self.last_error = None;
         self.send(Payload::Hello(v1::Hello {
@@ -438,21 +759,26 @@ impl State {
     fn drop_connection(&mut self, reason: String) {
         let Some(c) = self.conn.take() else { return };
         c.writer.shutdown();
+        self.transfers.disconnected();
         tracing::info!("connection to {} closed: {reason}", c.addr);
         self.peer = None;
         self.round_trip = None;
         self.last_error = Some(reason);
         let fx = self.router.disconnected();
         self.apply(fx);
+        let fx = self.drag.reset(cursor_position());
+        self.apply_drag(fx);
     }
 
     fn on_frame(&mut self, env: v1::Envelope) {
         if let Some(c) = &mut self.conn {
             c.last_seen = Instant::now();
+            c.drag_capable = env.protocol_minor >= 1;
         }
         let Some(payload) = env.payload else { return };
         match payload {
             Payload::Hello(h) => {
+                self.transfers.peer_identified(h.device_id);
                 let address = self
                     .conn
                     .as_ref()
@@ -475,14 +801,64 @@ impl State {
                     c.ping_sent = None;
                 }
             }
+            Payload::DragOffer(o) => self.on_drag_offer(o),
+            Payload::DragEnd(e) => {
+                let fx = self.drag.drag_end_received(e.drag_id);
+                self.apply_drag(fx);
+            }
             other => {
+                let forwarded_left_up = matches!(
+                    other,
+                    Payload::MouseButton(v1::MouseButton {
+                        button: 0,
+                        down: false,
+                        ..
+                    })
+                ) && matches!(self.router.role(), Role::Controlled { .. });
+                let before = self.router.role();
                 let fx = self.router.on_peer(other);
                 self.apply(fx);
+                if forwarded_left_up {
+                    let fx = self.drag.forwarded_left_up();
+                    self.apply_drag(fx);
+                }
+                // The peer handed control back while our user's hand still
+                // holds a drag that was suspended here.
+                if matches!(before, Role::Controlling { .. }) && self.router.role() == Role::Local {
+                    let fx = self.drag.crossing_in();
+                    self.apply_drag(fx);
+                }
             }
         }
     }
 
     fn tick(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<u64> = self
+            .overlay_deadlines
+            .iter()
+            .filter(|(_, t)| *t <= now)
+            .map(|(r, _)| *r)
+            .collect();
+        self.overlay_deadlines.retain(|(_, t)| *t > now);
+        for request in expired {
+            tracing::warn!("drag overlay did not appear in time");
+            let fx = self.drag.overlay_timeout(request);
+            self.apply_drag(fx);
+        }
+        let hides: Vec<u64> = self
+            .shield_hides
+            .iter()
+            .filter(|(_, t)| *t <= now)
+            .map(|(r, _)| *r)
+            .collect();
+        self.shield_hides.retain(|(_, t)| *t > now);
+        for request in hides {
+            if let Some(ui) = &self.ui {
+                ui.hide_shield(request);
+            }
+        }
+
         let Some(c) = &mut self.conn else { return };
         if c.last_seen.elapsed() > PEER_TIMEOUT {
             self.drop_connection("对方无响应（超时）".into());
@@ -524,13 +900,35 @@ impl State {
                     self.set_mode(CaptureMode::Local);
                     self.fn_remap.release();
                     self.cursor.unlock(Some(at));
+                    // The tap never saw the release if it happened while
+                    // forwarding; trust the hardware state.
+                    self.left_down = physical_left_down();
+                    if !self.drag.has_proxy() {
+                        let fx = self.drag.crossing_in();
+                        self.apply_drag(fx);
+                    }
                 }
                 Effect::BeginControlled { at } => {
                     self.injector.warp(at);
                     self.set_mode(CaptureMode::Controlled);
+                    // A drag of ours carried to the peer comes back: it
+                    // continues under the injected button.
+                    let fx = self.drag.crossing_in();
+                    self.apply_drag(fx);
+                    // A press arriving from the peer starts a fresh drag.
+                    if let Some(pb) = &self.drag_pb {
+                        pb.changed();
+                    }
                 }
-                Effect::EndControlled => {
-                    self.injector.release_all();
+                Effect::EndControlled { handoff } => {
+                    if handoff && self.injector.left_down() {
+                        self.crossed_out(Driver::Injected);
+                    } else if !handoff {
+                        let fx = self.drag.reset(cursor_position());
+                        self.apply_drag(fx);
+                    }
+                    let keep_left = self.drag.keeps_injected_left();
+                    self.injector.release_all_but_left(keep_left);
                     self.set_mode(CaptureMode::Local);
                 }
                 Effect::InjectMove { to, dx, dy } => self.injector.move_to(to, dx, dy),
@@ -607,6 +1005,13 @@ fn current_desktop() -> Desktop {
         }])
         .expect("nominal desktop")
     })
+}
+
+fn random_bytes() -> Vec<u8> {
+    let mut b = vec![0u8; 16];
+    // SAFETY: arc4random_buf fills exactly the buffer given.
+    unsafe { libc::arc4random_buf(b.as_mut_ptr().cast(), b.len()) };
+    b
 }
 
 fn random_u64() -> u64 {

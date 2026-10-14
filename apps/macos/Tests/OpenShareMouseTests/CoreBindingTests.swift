@@ -6,13 +6,16 @@ struct CoreBindingTests {
     @Test func buildInfoComesFromRust() {
         let info = buildInfo()
         #expect(info.protocolMajor == 1)
+        #expect(info.protocolMinor >= 1)
         #expect(info.defaultPort == 49001)
     }
 
     @Test func agentStartsLocal() {
-        let status = Agent(deviceName: "test").status()
+        let agent = Agent(deviceName: "test", overlay: nil)
+        let status = agent.status()
         #expect(status.role == .local)
         #expect(status.sharingEnabled)
+        #expect(agent.transfers().isEmpty)
     }
 
     @Test func permissionReportListsCaptureAndInjection() {

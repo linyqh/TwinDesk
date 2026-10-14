@@ -133,9 +133,17 @@ pub fn listen(if_index: u32, port: u16) -> io::Result<TcpListener> {
 }
 
 pub fn connect(if_index: u32, addr: SocketAddrV4) -> io::Result<TcpStream> {
+    connect_with_timeout(if_index, addr, Duration::from_secs(2))
+}
+
+pub fn connect_with_timeout(
+    if_index: u32,
+    addr: SocketAddrV4,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
     let s = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
     bind_to_interface(s.as_raw_fd(), if_index)?;
-    s.connect_timeout(&SocketAddr::V4(addr).into(), Duration::from_secs(2))?;
+    s.connect_timeout(&SocketAddr::V4(addr).into(), timeout)?;
     Ok(s.into())
 }
 
@@ -144,6 +152,34 @@ pub fn connect(if_index: u32, addr: SocketAddrV4) -> io::Result<TcpStream> {
 pub fn tune(stream: &TcpStream) -> io::Result<()> {
     stream.set_nodelay(true)?;
     socket2::SockRef::from(stream).set_keepalive(true)?;
+    Ok(())
+}
+
+/// Darwin `SO_NET_SERVICE_TYPE` / `NET_SERVICE_TYPE_BK` (sys/socket.h).
+const SO_NET_SERVICE_TYPE: libc::c_int = 0x1116;
+const NET_SERVICE_TYPE_BK: libc::c_int = 1;
+
+/// Bulk connections carry file data. Marking them background lets the
+/// interface queue send control frames (input) first when both compete,
+/// and large buffers keep a fast link busy.
+pub fn tune_bulk(stream: &TcpStream) -> io::Result<()> {
+    let v = NET_SERVICE_TYPE_BK;
+    // SAFETY: setsockopt with a valid fd and an int-sized option value.
+    let rc = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            SO_NET_SERVICE_TYPE,
+            &v as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let s = socket2::SockRef::from(stream);
+    s.set_send_buffer_size(4 * 1024 * 1024)?;
+    s.set_recv_buffer_size(4 * 1024 * 1024)?;
     Ok(())
 }
 

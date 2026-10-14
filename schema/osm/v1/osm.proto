@@ -1,5 +1,11 @@
 // OSM/1 wire schema, v1 scope: two Macs over a Thunderbolt Bridge cable.
 // Message numbers may still change until the protocol is frozen.
+//
+// Two kinds of TCP connection exist:
+// - one control connection carrying `Envelope` frames (input, sessions,
+//   drag-and-drop coordination);
+// - short-lived bulk connections carrying `BulkFrame`s, one per dropped
+//   item, so file data never queues in front of input (report §7.3).
 syntax = "proto3";
 
 package osm.v1;
@@ -32,6 +38,9 @@ message Envelope {
     MouseButton mouse_button = 49;
     Scroll scroll = 50;
     Key key = 51;
+
+    DragOffer drag_offer = 64;
+    DragEnd drag_end = 65;
   }
 }
 
@@ -114,4 +123,117 @@ message Key {
   bool down = 2;
   bool repeat = 3;
   uint64 flags = 4;
+}
+
+// ---- Drag and drop (report §10) ----------------------------------------
+
+enum EntryKind {
+  ENTRY_KIND_UNSPECIFIED = 0;
+  ENTRY_KIND_FILE = 1;
+  ENTRY_KIND_DIRECTORY = 2;
+  ENTRY_KIND_SYMLINK = 3;
+}
+
+// One top-level dragged item. Directory sizes are not computed up front:
+// walking a large tree would delay the cursor crossing.
+message DragItem {
+  string name = 1;
+  EntryKind kind = 2;
+  uint64 size = 3;
+}
+
+// Origin -> peer, right after the Enter or Leave that carried the cursor
+// across while a file drag was in progress. The peer starts a native drag
+// of file promises; contents are only fetched once something accepts the
+// drop. `token` must accompany every bulk fetch for this drag.
+message DragOffer {
+  uint64 drag_id = 1;
+  // Session epoch of the crossing this offer belongs to.
+  uint64 epoch = 2;
+  bytes token = 3;
+  uint32 bulk_port = 4;
+  repeated DragItem items = 5;
+}
+
+// Proxy -> origin: the drag shown on the peer is over (dropped somewhere or
+// rejected), so the origin must end its own suspended drag without dropping.
+message DragEnd {
+  uint64 drag_id = 1;
+  bool dropped = 2;
+}
+
+// ---- Bulk connection -----------------------------------------------------
+//
+// Frames are `u32_be length + BulkFrame`. The receiver sends one
+// FetchRequest; the sender answers with the manifest pages, ManifestEnd,
+// then for every FILE entry in manifest order its FileChunks followed by
+// FileEnd, and finally TransferDone. TransferFailed may replace any frame
+// after the request. Either side cancels by closing the connection.
+
+message BulkFrame {
+  oneof body {
+    FetchRequest fetch = 1;
+    ManifestPage manifest = 2;
+    ManifestEnd manifest_end = 3;
+    FileChunk chunk = 4;
+    FileEnd file_end = 5;
+    TransferDone done = 6;
+    TransferFailed failed = 7;
+  }
+}
+
+message FetchRequest {
+  uint64 drag_id = 1;
+  bytes token = 2;
+  uint32 item_index = 3;
+}
+
+// Paths are `/`-separated and start with the item's own name. Entries come
+// in depth-first pre-order, so every parent precedes its children.
+message ManifestEntry {
+  string path = 1;
+  EntryKind kind = 2;
+  uint64 size = 3;
+  // Permission bits only (0o777); never setuid/setgid/sticky.
+  uint32 mode = 4;
+  int64 mtime_sec = 5;
+  uint32 mtime_nsec = 6;
+  string link_target = 7;
+}
+
+message ManifestPage {
+  repeated ManifestEntry entries = 1;
+}
+
+message ManifestEnd {
+  uint64 entry_count = 1;
+  uint64 total_bytes = 2;
+}
+
+message FileChunk {
+  bytes data = 1;
+}
+
+message FileEnd {
+  // SHA-256 of the file contents as read by the sender.
+  bytes sha256 = 1;
+}
+
+message TransferDone {}
+
+enum TransferErrorCode {
+  TRANSFER_ERROR_CODE_UNSPECIFIED = 0;
+  // Unknown drag, expired offer or bad token.
+  TRANSFER_ERROR_CODE_NOT_FOUND = 1;
+  TRANSFER_ERROR_CODE_PERMISSION_DENIED = 2;
+  // A file changed size or timestamp while it was being read.
+  TRANSFER_ERROR_CODE_SOURCE_CHANGED = 3;
+  TRANSFER_ERROR_CODE_IO = 4;
+  // Too many entries or a tree too deep.
+  TRANSFER_ERROR_CODE_LIMIT = 5;
+}
+
+message TransferFailed {
+  TransferErrorCode code = 1;
+  string message = 2;
 }

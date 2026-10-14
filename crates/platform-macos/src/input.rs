@@ -54,7 +54,15 @@ impl CaptureMode {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum InputEvent {
     /// Local mode: physical motion with the cursor position after it.
-    LocalMove { pos: LogicalPoint, dx: f64, dy: f64 },
+    /// `left_down` is set for left-button drags.
+    LocalMove {
+        pos: LogicalPoint,
+        dx: f64,
+        dy: f64,
+        left_down: bool,
+    },
+    /// Local mode: the physical left button went down or up.
+    LocalLeftButton { down: bool },
     /// Forwarding mode: raw motion delta in points.
     Move { dx: i32, dy: i32 },
     Button {
@@ -273,7 +281,18 @@ unsafe extern "C" fn tap_callback(
                         CGEventGetIntegerValueField(event, kCGMouseEventDeltaY) as f64,
                     )
                 };
-                let _ = state.tx.try_send(InputEvent::LocalMove { pos, dx, dy });
+                let _ = state.tx.try_send(InputEvent::LocalMove {
+                    pos,
+                    dx,
+                    dy,
+                    left_down: event_type == kCGEventLeftMouseDragged,
+                });
+            } else if !injected
+                && (event_type == kCGEventLeftMouseDown || event_type == kCGEventLeftMouseUp)
+            {
+                let _ = state.tx.try_send(InputEvent::LocalLeftButton {
+                    down: event_type == kCGEventLeftMouseDown,
+                });
             }
             event
         }
@@ -392,6 +411,28 @@ unsafe fn translate(t: CGEventType, event: CGEventRef) -> Option<InputEvent> {
             }
             _ => return None,
         })
+    }
+}
+
+/// Hardware state of the left button, whether or not our tap let the press
+/// through to this Mac.
+pub fn physical_left_down() -> bool {
+    // SAFETY: plain query.
+    unsafe { CGEventSourceButtonState(kCGEventSourceStateHIDSystemState, kCGMouseButtonLeft) }
+}
+
+/// Current cursor location in Quartz global coordinates.
+pub fn cursor_position() -> LogicalPoint {
+    // SAFETY: CGEventCreate(NULL) carries the current location; released
+    // right after reading it.
+    unsafe {
+        let e = CGEventCreate(std::ptr::null_mut());
+        if e.is_null() {
+            return LogicalPoint { x: 0.0, y: 0.0 };
+        }
+        let p = CGEventGetLocation(e);
+        CFRelease(e);
+        LogicalPoint { x: p.x, y: p.y }
     }
 }
 
@@ -581,8 +622,22 @@ impl Injector {
         }
     }
 
+    /// Presses and releases Escape with no modifiers.
+    pub fn tap_escape(&mut self) {
+        const KEY_ESCAPE: u16 = 53;
+        self.key(KEY_ESCAPE, true, false, 0);
+        self.key(KEY_ESCAPE, false, false, 0);
+    }
+
     /// Releases every key and button this injector pressed, and nothing else.
     pub fn release_all(&mut self) {
+        self.release_all_but_left(false);
+    }
+
+    /// Like [`release_all`](Self::release_all), but with `keep_left` the left
+    /// button stays down: a file drag started on this Mac is still held while
+    /// the cursor is on the peer, and releasing it here would drop the files.
+    pub fn release_all_but_left(&mut self, keep_left: bool) {
         for keycode in std::mem::take(&mut self.keys_down).into_iter().rev() {
             self.flags = 0;
             // SAFETY: fresh event, released in finish.
@@ -595,10 +650,44 @@ impl Injector {
             }
         }
         for b in 0..self.buttons_down.len() {
+            if b == 0 && keep_left {
+                continue;
+            }
             if self.buttons_down[b] {
                 self.button(b as u32, false, 1);
             }
         }
+    }
+
+    pub fn left_down(&self) -> bool {
+        self.buttons_down[0]
+    }
+
+    /// Re-posts the current position so an in-progress drag re-targets
+    /// whatever window is under the cursor now (e.g. a shield that just
+    /// appeared under a stationary drag).
+    pub fn nudge(&mut self) {
+        self.move_to(self.pos, 0, 0);
+    }
+
+    /// Posts a left-button edge at the current cursor position without
+    /// touching the tracked button state. Used on the Mac whose physical
+    /// button is held: the OS never saw its press (it was forwarded), so the
+    /// drag hand-off has to synthesize one, and later end it.
+    pub fn post_untracked_left(&mut self, edge: UntrackedLeft) {
+        let at = cursor_position();
+        let t = match edge {
+            UntrackedLeft::Down => kCGEventLeftMouseDown,
+            UntrackedLeft::Drag => kCGEventLeftMouseDragged,
+            UntrackedLeft::Up => kCGEventLeftMouseUp,
+        };
+        let saved = self.pos;
+        self.pos = at;
+        self.post_mouse(t, kCGMouseButtonLeft, |e| {
+            // SAFETY: e is a fresh event owned by post_mouse.
+            unsafe { CGEventSetIntegerValueField(e, kCGMouseEventClickState, 1) };
+        });
+        self.pos = saved;
     }
 
     fn source(&self) -> CGEventSourceRef {
@@ -646,6 +735,13 @@ impl Drop for Injector {
             unsafe { CFRelease(self.source()) };
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UntrackedLeft {
+    Down,
+    Drag,
+    Up,
 }
 
 /// Freezes and hides the local cursor while this Mac controls the peer.

@@ -12,6 +12,7 @@ struct MainView: View {
             CableSection()
             PeerSection()
             ControlSection()
+            TransferSection()
             if let error = model.status.lastError {
                 Section {
                     Label(error, systemImage: "exclamationmark.circle")
@@ -148,6 +149,92 @@ private struct ControlSection: View {
             }
             .font(.caption)
             .foregroundStyle(.secondary)
+        }
+    }
+}
+
+// MARK: - File transfer
+
+private struct TransferSection: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Section("文件拖拽") {
+            if model.transfers.isEmpty {
+                Text("控制对方电脑时，直接把文件从本机的访达拖过屏幕边缘，放到对方的访达窗口或桌面即可复制过去；反过来也一样。文件只经雷雳数据线传输。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(model.transfers, id: \.id) { t in
+                TransferRow(transfer: t)
+            }
+        }
+    }
+}
+
+private struct TransferRow: View {
+    @Environment(AppModel.self) private var model
+    let transfer: TransferStatus
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Image(systemName: transfer.direction == .sending ? "arrow.up.doc" : "arrow.down.doc")
+                    .foregroundStyle(.secondary)
+                Text(transfer.name).lineLimit(1).truncationMode(.middle)
+                Spacer()
+                switch transfer.phase {
+                case .finished:
+                    if transfer.destination != nil {
+                        Button("在访达中显示") { model.revealTransfer(transfer) }
+                            .buttonStyle(.link)
+                    }
+                case .failed:
+                    Button("移除") { model.dismissTransfer(transfer) }.buttonStyle(.link)
+                default:
+                    Button {
+                        model.cancelTransfer(transfer)
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("取消")
+                }
+            }
+            if transfer.phase != .finished && transfer.phase != .failed {
+                ProgressView(value: fraction)
+            }
+            Text(detail)
+                .font(.caption)
+                .foregroundStyle(transfer.phase == .failed ? .red : .secondary)
+                .lineLimit(2)
+        }
+    }
+
+    private var fraction: Double {
+        guard transfer.totalBytes > 0 else {
+            return transfer.phase == .committing ? 1 : 0
+        }
+        return min(1, Double(transfer.doneBytes) / Double(transfer.totalBytes))
+    }
+
+    private var detail: String {
+        let bytes = ByteCountFormatter.string(fromByteCount: Int64(clamping: transfer.doneBytes), countStyle: .file)
+        let total = ByteCountFormatter.string(fromByteCount: Int64(clamping: transfer.totalBytes), countStyle: .file)
+        let verb = transfer.direction == .sending ? "发送" : "接收"
+        switch transfer.phase {
+        case .connecting: return "正在连接…"
+        case .scanning: return transfer.direction == .sending ? "正在读取文件列表…" : "等待对方读取文件列表…"
+        case .transferring:
+            let speed = ByteCountFormatter.string(fromByteCount: Int64(transfer.bytesPerSecond), countStyle: .file)
+            var text = "正在\(verb) \(bytes) / \(total) · \(speed)/秒"
+            if transfer.totalFiles > 1 {
+                text += " · \(transfer.doneFiles)/\(transfer.totalFiles) 个文件"
+            }
+            return text
+        case .committing: return "正在校验并保存…"
+        case .finished: return "已\(verb) \(total)"
+        case .failed: return transfer.error ?? "传输失败"
         }
     }
 }

@@ -147,6 +147,7 @@ unsafe extern "C" {
         wheel3: i32,
     ) -> CGEventRef;
     pub fn CGEventPost(tap: u32, event: CGEventRef);
+    pub fn CGEventSourceButtonState(state: i32, button: u32) -> bool;
 
     pub fn CGWarpMouseCursorPosition(p: CGPoint) -> CGError;
     pub fn CGAssociateMouseAndMouseCursorPosition(connected: i32) -> CGError;

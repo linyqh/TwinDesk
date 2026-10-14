@@ -4,7 +4,9 @@
 //! hot path goes through here: the UI only polls a status snapshot and sends
 //! a handful of commands.
 
-use osm_agent::{Command, Engine, LinkState as AgentLink, Role};
+use std::sync::Arc;
+
+use osm_agent::{Command, Direction, DragItemInfo, DragUi, Engine, LinkState as AgentLink, Role};
 use osm_core::Side;
 use osm_model::CapabilityState;
 
@@ -152,6 +154,94 @@ pub fn request_permissions() {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct DragItem {
+    pub name: String,
+    pub is_directory: bool,
+    pub size: u64,
+}
+
+/// Invisible panels for cross-machine drag and drop, implemented in Swift.
+/// Called from the engine thread: implementations hop to the main thread
+/// and return immediately.
+#[uniffi::export(foreign)]
+pub trait DragOverlay: Send + Sync {
+    /// Panel at (`x`, `y`) in Quartz global points that refuses drops.
+    /// Report with `Agent::overlay_ready(request)` once it is on screen.
+    fn show_shield(&self, request: u64, x: f64, y: f64);
+    fn hide_shield(&self, request: u64);
+    /// Panel at (`x`, `y`); the next left press on it starts a drag of file
+    /// promises for `items`. Report `overlay_ready(request)` when on screen
+    /// and `proxy_ended(drag_id, dropped)` when the drag session ends.
+    fn begin_proxy(&self, request: u64, drag_id: u64, items: Vec<DragItem>, x: f64, y: f64);
+    fn end_proxy(&self, drag_id: u64);
+}
+
+struct OverlayBridge(Arc<dyn DragOverlay>);
+
+impl DragUi for OverlayBridge {
+    fn show_shield(&self, request: u64, x: f64, y: f64) {
+        self.0.show_shield(request, x, y);
+    }
+    fn hide_shield(&self, request: u64) {
+        self.0.hide_shield(request);
+    }
+    fn begin_proxy(&self, request: u64, drag_id: u64, items: Vec<DragItemInfo>, x: f64, y: f64) {
+        let items = items
+            .into_iter()
+            .map(|i| DragItem {
+                name: i.name,
+                is_directory: i.is_directory,
+                size: i.size,
+            })
+            .collect();
+        self.0.begin_proxy(request, drag_id, items, x, y);
+    }
+    fn end_proxy(&self, drag_id: u64) {
+        self.0.end_proxy(drag_id);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum TransferDirection {
+    Sending,
+    Receiving,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum TransferPhase {
+    Connecting,
+    Scanning,
+    Transferring,
+    Committing,
+    Finished,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct TransferStatus {
+    pub id: u64,
+    pub direction: TransferDirection,
+    pub name: String,
+    pub phase: TransferPhase,
+    pub total_bytes: u64,
+    pub done_bytes: u64,
+    pub total_files: u64,
+    pub done_files: u64,
+    /// Average throughput since the transfer started, bytes per second.
+    pub bytes_per_second: f64,
+    pub error: Option<String>,
+    pub destination: Option<String>,
+}
+
+#[derive(Debug, uniffi::Error, thiserror::Error)]
+pub enum FetchError {
+    #[error("{message}")]
+    Failed { message: String },
+    #[error("已取消")]
+    Cancelled,
+}
+
 /// Owns the sharing engine for the lifetime of the app.
 #[derive(Debug, uniffi::Object)]
 pub struct Agent {
@@ -161,10 +251,91 @@ pub struct Agent {
 #[uniffi::export]
 impl Agent {
     #[uniffi::constructor]
-    pub fn new(device_name: String) -> Self {
+    pub fn new(device_name: String, overlay: Option<Arc<dyn DragOverlay>>) -> Self {
+        let ui = overlay.map(|o| Arc::new(OverlayBridge(o)) as Arc<dyn DragUi>);
         Self {
-            engine: Engine::start(device_name),
+            engine: Engine::start(device_name, ui),
         }
+    }
+
+    pub fn overlay_ready(&self, request: u64) {
+        self.engine.send(Command::OverlayReady(request));
+    }
+
+    pub fn proxy_ended(&self, drag_id: u64, dropped: bool) {
+        self.engine.send(Command::ProxyEnded { drag_id, dropped });
+    }
+
+    /// Fetches item `index` of the peer's drag `drag_id` to `destination`
+    /// and returns the path it was committed at (which may carry a " 2"
+    /// suffix). Blocks until done: call it off the main thread.
+    pub fn fetch_dropped_item(
+        &self,
+        drag_id: u64,
+        index: u32,
+        destination: String,
+    ) -> Result<String, FetchError> {
+        match self
+            .engine
+            .transfers()
+            .fetch(drag_id, index, std::path::Path::new(&destination))
+        {
+            Ok(p) => Ok(p.to_string_lossy().into_owned()),
+            Err(osm_transfer::TransferError::Cancelled) => Err(FetchError::Cancelled),
+            Err(e) => Err(FetchError::Failed {
+                message: e.to_string(),
+            }),
+        }
+    }
+
+    pub fn transfers(&self) -> Vec<TransferStatus> {
+        use osm_transfer::Phase;
+        self.engine
+            .transfers()
+            .list()
+            .into_iter()
+            .map(|t| {
+                let secs = t.started.elapsed().as_secs_f64();
+                TransferStatus {
+                    id: t.id,
+                    direction: match t.direction {
+                        Direction::Send => TransferDirection::Sending,
+                        Direction::Receive => TransferDirection::Receiving,
+                    },
+                    name: t.name,
+                    phase: if t.error.is_some() {
+                        TransferPhase::Failed
+                    } else {
+                        match t.progress.phase {
+                            Phase::Connecting => TransferPhase::Connecting,
+                            Phase::Scanning => TransferPhase::Scanning,
+                            Phase::Transferring => TransferPhase::Transferring,
+                            Phase::Committing => TransferPhase::Committing,
+                            Phase::Finished => TransferPhase::Finished,
+                        }
+                    },
+                    total_bytes: t.progress.total_bytes,
+                    done_bytes: t.progress.done_bytes,
+                    total_files: t.progress.total_files,
+                    done_files: t.progress.done_files,
+                    bytes_per_second: if secs > 0.0 {
+                        t.progress.done_bytes as f64 / secs
+                    } else {
+                        0.0
+                    },
+                    error: t.error,
+                    destination: t.destination.map(|p| p.to_string_lossy().into_owned()),
+                }
+            })
+            .collect()
+    }
+
+    pub fn cancel_transfer(&self, id: u64) {
+        self.engine.transfers().cancel(id);
+    }
+
+    pub fn dismiss_transfer(&self, id: u64) {
+        self.engine.transfers().dismiss(id);
     }
 
     pub fn status(&self) -> AgentStatus {
@@ -252,9 +423,14 @@ mod tests {
 
     #[test]
     fn agent_starts_and_reports_local() {
-        let agent = Agent::new("test".into());
+        let agent = Agent::new("test".into(), None);
         let s = agent.status();
         assert_eq!(s.role, ControlRole::Local);
         assert!(s.sharing_enabled);
+        assert!(agent.transfers().is_empty());
+        assert!(matches!(
+            agent.fetch_dropped_item(1, 0, "/tmp/x".into()),
+            Err(FetchError::Failed { .. })
+        ));
     }
 }

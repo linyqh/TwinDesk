@@ -13,6 +13,7 @@ osm-model.workspace = true
 osm-platform-macos.workspace = true
 osm-protocol.workspace = true
 osm-transport.workspace = true
+osm-transfer.workspace = true
 tracing.workspace = true
 libc.workspace = true
 

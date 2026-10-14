@@ -20,6 +20,8 @@ osm-model.workspace = true
 osm-platform-macos.workspace = true
 osm-protocol.workspace = true
 osm-transport.workspace = true
+osm-transfer.workspace = true
+thiserror.workspace = true
 uniffi.workspace = true
 
 [lints]
