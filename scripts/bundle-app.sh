@@ -55,7 +55,14 @@ if [[ -z "$IDENTITY" ]]; then
   IDENTITY="-"
 fi
 
-codesign --force --options runtime --timestamp=none \
+# Notarization requires a secure timestamp; skip it for debug builds so
+# signing works offline and stays fast.
+if [[ "$CONFIG" == "release" && "$IDENTITY" != "-" ]]; then
+  TIMESTAMP="--timestamp"
+else
+  TIMESTAMP="--timestamp=none"
+fi
+codesign --force --options runtime "$TIMESTAMP" \
   --entitlements "$APP_DIR/Support/OpenShareMouse.entitlements" \
   --sign "$IDENTITY" "$APP"
 codesign --verify --strict --verbose=2 "$APP"
