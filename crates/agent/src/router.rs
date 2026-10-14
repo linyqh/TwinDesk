@@ -4,10 +4,10 @@
 //! peer messages and returns `Effect`s for the engine to carry out, so the
 //! switching rules can be tested without event taps or sockets.
 
-use osm_core::keys::{FLAG_COMMAND, FLAG_CONTROL, KEY_ESCAPE};
+use osm_core::keys::{FLAG_COMMAND, FLAG_CONTROL, FnRestore, KEY_ESCAPE, KeyStroke};
 use osm_core::{Desktop, Side};
 use osm_model::LogicalPoint;
-use osm_platform_macos::InputEvent;
+use osm_platform_macos::{InputEvent, REMAPPED_FN_KEYCODE};
 use osm_protocol::v1::{self, LeaveReason};
 
 /// Ctrl+Cmd+Esc while controlling the peer returns control immediately,
@@ -78,6 +78,8 @@ pub struct Router {
     /// Controlled side: tracked position of the injected cursor.
     remote_pos: LogicalPoint,
     sharing_enabled: bool,
+    /// Turns the locally remapped Fn key back into Fn for the peer.
+    fn_restore: FnRestore,
 }
 
 impl Router {
@@ -91,6 +93,7 @@ impl Router {
             park: center,
             remote_pos: center,
             sharing_enabled: true,
+            fn_restore: FnRestore::default(),
         }
     }
 
@@ -168,6 +171,7 @@ impl Router {
                 let epoch = self.next_epoch;
                 self.next_epoch += 1;
                 self.role = Role::Controlling { epoch };
+                self.fn_restore.reset();
                 self.park = self
                     .desktop
                     .entry_point(self.peer_side, self.desktop.y_ratio(pos));
@@ -237,11 +241,20 @@ impl Router {
                     repeat,
                     flags,
                 } => {
+                    let k = self.fn_restore.apply(
+                        KeyStroke {
+                            keycode,
+                            down,
+                            repeat,
+                            flags,
+                        },
+                        REMAPPED_FN_KEYCODE,
+                    );
                     vec![Effect::Send(v1::envelope::Payload::Key(v1::Key {
-                        keycode: keycode.into(),
-                        down,
-                        repeat,
-                        flags,
+                        keycode: k.keycode.into(),
+                        down: k.down,
+                        repeat: k.repeat,
+                        flags: k.flags,
                     }))]
                 }
                 _ => Vec::new(),
@@ -475,6 +488,36 @@ mod tests {
         assert_eq!(r.role(), Role::Local);
         assert!(matches!(&fx[0], Effect::Send(P::Leave(l)) if l.epoch == epoch));
         assert!(matches!(fx[1], Effect::EndForwarding { .. }));
+    }
+
+    #[test]
+    fn remapped_fn_is_forwarded_as_fn() {
+        use osm_core::keys::{FLAG_SECONDARY_FN, KEY_FUNCTION};
+        let mut r = Router::new(desktop(), Side::Right);
+        start_controlling(&mut r);
+        let fx = r.on_local(InputEvent::Key {
+            keycode: REMAPPED_FN_KEYCODE,
+            down: true,
+            repeat: false,
+            flags: 0x100,
+        });
+        let [Effect::Send(P::Key(k))] = &fx[..] else {
+            panic!("{fx:?}")
+        };
+        assert_eq!(k.keycode, u32::from(KEY_FUNCTION));
+        assert!(k.down);
+        assert_eq!(k.flags & FLAG_SECONDARY_FN, FLAG_SECONDARY_FN);
+        // A key pressed while Fn is held carries the Fn flag.
+        let fx = r.on_local(InputEvent::Key {
+            keycode: 0,
+            down: true,
+            repeat: false,
+            flags: 0,
+        });
+        let [Effect::Send(P::Key(k))] = &fx[..] else {
+            panic!("{fx:?}")
+        };
+        assert_eq!(k.flags & FLAG_SECONDARY_FN, FLAG_SECONDARY_FN);
     }
 
     #[test]

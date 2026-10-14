@@ -17,7 +17,8 @@ release:
 test: test-rust test-swift
 
 test-rust:
-	cargo test --workspace
+	# Single-threaded: the Fn remap tests change real HID system state.
+	cargo test --workspace -- --test-threads=1
 
 test-swift:
 	scripts/build-rust.sh debug

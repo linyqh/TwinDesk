@@ -4,6 +4,7 @@
 //! direction is whether the key's flag is set in the new flags.
 
 pub const KEY_ESCAPE: u16 = 53;
+pub const KEY_FUNCTION: u16 = 63;
 
 pub const FLAG_ALPHA_SHIFT: u64 = 0x0001_0000;
 pub const FLAG_SHIFT: u64 = 0x0002_0000;
@@ -20,7 +21,7 @@ pub fn modifier_flag(keycode: u16) -> Option<u64> {
         58 | 61 => Some(FLAG_ALTERNATE),
         55 | 54 => Some(FLAG_COMMAND),
         57 => Some(FLAG_ALPHA_SHIFT),
-        63 => Some(FLAG_SECONDARY_FN),
+        KEY_FUNCTION => Some(FLAG_SECONDARY_FN),
         _ => None,
     }
 }
@@ -30,9 +31,76 @@ pub fn modifier_is_down(keycode: u16, flags: u64) -> bool {
     modifier_flag(keycode).is_some_and(|f| flags & f != 0)
 }
 
+/// A key event as captured, before forwarding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyStroke {
+    pub keycode: u16,
+    pub down: bool,
+    pub repeat: bool,
+    pub flags: u64,
+}
+
+/// Undoes the local Fn remap while forwarding.
+///
+/// Physical Fn is remapped to `remapped_keycode` (F19) below the event tap
+/// chain so local apps never see it. This turns that key back into Fn for
+/// the peer and keeps the Fn flag on every key pressed while it is held,
+/// since the HID system no longer sets it once Fn is remapped.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FnRestore {
+    held: bool,
+}
+
+impl FnRestore {
+    pub fn held(&self) -> bool {
+        self.held
+    }
+
+    pub fn reset(&mut self) {
+        self.held = false;
+    }
+
+    pub fn apply(&mut self, k: KeyStroke, remapped_keycode: u16) -> KeyStroke {
+        if k.keycode == remapped_keycode {
+            if !k.repeat {
+                self.held = k.down;
+            }
+            let flags = if k.down {
+                k.flags | FLAG_SECONDARY_FN
+            } else {
+                k.flags & !FLAG_SECONDARY_FN
+            };
+            return KeyStroke {
+                keycode: KEY_FUNCTION,
+                down: k.down,
+                repeat: k.repeat,
+                flags,
+            };
+        }
+        if self.held {
+            return KeyStroke {
+                flags: k.flags | FLAG_SECONDARY_FN,
+                ..k
+            };
+        }
+        k
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const F19: u16 = 80;
+
+    fn key(keycode: u16, down: bool, flags: u64) -> KeyStroke {
+        KeyStroke {
+            keycode,
+            down,
+            repeat: false,
+            flags,
+        }
+    }
 
     #[test]
     fn left_and_right_shift_share_a_flag() {
@@ -46,5 +114,55 @@ mod tests {
         assert_eq!(modifier_flag(0), None); // 'a'
         assert_eq!(modifier_flag(KEY_ESCAPE), None);
         assert!(!modifier_is_down(0, u64::MAX));
+    }
+
+    #[test]
+    fn fn_is_a_modifier() {
+        assert!(modifier_is_down(KEY_FUNCTION, FLAG_SECONDARY_FN));
+        assert!(!modifier_is_down(KEY_FUNCTION, 0));
+    }
+
+    #[test]
+    fn remapped_key_becomes_fn_with_flag() {
+        let mut r = FnRestore::default();
+        let down = r.apply(key(F19, true, 0x100), F19);
+        assert_eq!(down, key(KEY_FUNCTION, true, 0x100 | FLAG_SECONDARY_FN));
+        assert!(r.held());
+        let up = r.apply(key(F19, false, 0x100 | FLAG_SECONDARY_FN), F19);
+        assert_eq!(up, key(KEY_FUNCTION, false, 0x100));
+        assert!(!r.held());
+    }
+
+    #[test]
+    fn keys_pressed_while_fn_held_carry_the_flag() {
+        let mut r = FnRestore::default();
+        r.apply(key(F19, true, 0), F19);
+        let a = r.apply(key(0, true, 0), F19);
+        assert_eq!(a.flags, FLAG_SECONDARY_FN);
+        r.apply(key(F19, false, 0), F19);
+        assert_eq!(r.apply(key(0, true, 0), F19).flags, 0);
+    }
+
+    #[test]
+    fn repeat_does_not_toggle_held() {
+        let mut r = FnRestore::default();
+        r.apply(key(F19, true, 0), F19);
+        r.apply(
+            KeyStroke {
+                keycode: F19,
+                down: true,
+                repeat: true,
+                flags: 0,
+            },
+            F19,
+        );
+        assert!(r.held());
+    }
+
+    #[test]
+    fn other_keys_untouched_when_fn_not_held() {
+        let mut r = FnRestore::default();
+        let k = key(12, true, FLAG_COMMAND);
+        assert_eq!(r.apply(k, F19), k);
     }
 }

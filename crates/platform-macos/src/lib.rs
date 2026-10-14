@@ -6,11 +6,13 @@
 
 #![cfg(target_os = "macos")]
 
+pub mod fn_remap;
 pub mod input;
 pub mod permissions;
 mod sys;
 pub mod thunderbolt;
 
+pub use fn_remap::{FnRemap, REMAPPED_FN_KEYCODE};
 pub use input::{
     Capture, CaptureError, CaptureMode, CursorLock, Injector, InputEvent, display_rects,
 };

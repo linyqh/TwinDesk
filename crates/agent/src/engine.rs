@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 
 use osm_core::{Desktop, Side};
 use osm_platform_macos::{
-    Capture, CaptureMode, CursorLock, Injector, InputEvent, ThunderboltStatus, display_rects,
+    Capture, CaptureMode, CursorLock, FnRemap, Injector, InputEvent, ThunderboltStatus,
+    display_rects,
 };
 use osm_protocol::envelope;
 use osm_protocol::v1::{self, envelope::Payload};
@@ -194,6 +195,7 @@ struct State {
     capture: Option<Capture>,
     injector: Injector,
     cursor: CursorLock,
+    fn_remap: FnRemap,
     router: Router,
 
     thunderbolt: ThunderboltStatus,
@@ -224,6 +226,7 @@ impl State {
             capture: None,
             injector: Injector::new(),
             cursor: CursorLock::default(),
+            fn_remap: FnRemap::default(),
             router: Router::new(desktop, Side::Right),
             thunderbolt: ThunderboltStatus::default(),
             net_error: None,
@@ -236,6 +239,11 @@ impl State {
             round_trip: None,
             sharing_enabled: true,
         };
+        // A crash while forwarding would leave Fn remapped; undo that first.
+        let stale = FnRemap::clear_stale();
+        if stale > 0 {
+            tracing::info!(keyboards = stale, "cleared Fn remap left by a previous run");
+        }
         s.start_capture();
         s
     }
@@ -286,6 +294,7 @@ impl State {
         let fx = self.router.abort();
         self.apply(fx);
         self.injector.release_all();
+        self.fn_remap.release();
         self.cursor.unlock(None);
         if let Some(c) = self.conn.take() {
             c.writer.shutdown();
@@ -505,11 +514,15 @@ impl State {
                         self.apply(undo);
                         continue;
                     }
+                    // Before forwarding starts, so no Fn press can slip through
+                    // to a local app that taps ahead of us.
+                    self.fn_remap.engage();
                     self.cursor.lock(park);
                     self.set_mode(CaptureMode::Forwarding);
                 }
                 Effect::EndForwarding { at } => {
                     self.set_mode(CaptureMode::Local);
+                    self.fn_remap.release();
                     self.cursor.unlock(Some(at));
                 }
                 Effect::BeginControlled { at } => {
