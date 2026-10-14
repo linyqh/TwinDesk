@@ -1,33 +1,25 @@
-//! Bulk file transfers for drag and drop, off the engine thread.
-//!
-//! - Serving: files this Mac offered in a `DragOffer` are served on a bulk
-//!   listener bound to the Thunderbolt Bridge, only to the connected peer's
-//!   address and only with the drag's random token.
-//! - Fetching: when a drop target asks for a promised file, the UI thread
-//!   calls [`Transfers::fetch`], which dials the peer and receives into the
-//!   destination.
-//!
-//! Every transfer has a `Progress` the UI polls and can cancel.
+//! Explicit file portal transfers, independent of pointer ownership.
+//! Offers are created only after a local drop. The receiver always saves
+//! into its locally configured Downloads directory and acknowledges commit.
 
 use std::collections::VecDeque;
 use std::io::{BufReader, BufWriter, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use osm_protocol::v1::{self, FetchRequest};
+use osm_protocol::v1::{self, FetchRequest, bulk_frame::Body};
+use osm_protocol::{read_bulk, write_bulk};
 use osm_transfer::{Progress, ProgressSnapshot, TransferError, receive, send};
 
-/// Offers kept per direction. Drop targets usually fetch right after the
-/// drop, but some (Mail, browsers) fetch later; older offers are forgotten.
+/// Recent received IDs prevent duplicate offers from creating duplicate files.
 const MAX_OFFERS: usize = 32;
-/// Running transfers per direction. The receiving UI fetches at most two
-/// at a time (report §7.3, D); this only stops a misbehaving peer from
-/// spawning unbounded sender threads.
-const MAX_RUNNING: usize = 16;
+/// Preserve the existing bound of 16 outstanding transfers per direction.
+/// A folder counts as one transfer regardless of its number of descendants.
+pub const MAX_RUNNING: usize = 16;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// No bytes for this long means the peer is gone; generous because the
@@ -72,14 +64,23 @@ struct Active {
 struct ServedOffer {
     drag_id: u64,
     token: Vec<u8>,
-    paths: Vec<PathBuf>,
+    items: Vec<Option<OfferedItem>>,
 }
 
-struct ReceivedOffer {
-    drag_id: u64,
-    token: Vec<u8>,
+struct OfferedItem {
+    path: PathBuf,
+    id: u64,
+    progress: Arc<Progress>,
+}
+
+struct ReceiveJob {
+    peer: PeerLink,
     port: u16,
-    names: Vec<String>,
+    request: FetchRequest,
+    downloads: PathBuf,
+    name: String,
+    id: u64,
+    progress: Arc<Progress>,
 }
 
 #[derive(Clone, Copy)]
@@ -91,10 +92,10 @@ struct PeerLink {
 #[derive(Default)]
 struct Inner {
     peer: Option<PeerLink>,
-    /// Survives reconnects, so offers stay valid across a brief drop.
+    /// Identity of the current peer.
     peer_device: Option<u64>,
     served: VecDeque<ServedOffer>,
-    received: VecDeque<ReceivedOffer>,
+    received: VecDeque<u64>,
     active: Vec<Active>,
     listener_port: Option<u16>,
 }
@@ -152,110 +153,207 @@ impl Transfers {
         }
     }
 
-    /// Stops accepting bulk connections. Running transfers continue; they
-    /// fail on their own if the cable is gone.
+    /// Retire pending offers on disconnect. Already connected bulk streams
+    /// may finish; unclaimed offers must not become accessible to a new peer.
     pub fn disconnected(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
-        self.inner.lock().unwrap().listener_port = None;
-    }
-
-    pub fn listener_port(&self) -> Option<u16> {
-        self.inner.lock().unwrap().listener_port
-    }
-
-    /// Makes `paths` fetchable for `drag_id` with `token`.
-    pub fn serve(&self, drag_id: u64, token: Vec<u8>, paths: Vec<PathBuf>) {
         let mut g = self.inner.lock().unwrap();
-        g.served.push_back(ServedOffer {
-            drag_id,
-            token,
-            paths,
-        });
-        while g.served.len() > MAX_OFFERS {
-            g.served.pop_front();
-        }
-    }
-
-    /// Remembers what the peer offered so a later drop can fetch it.
-    pub fn offer_received(&self, offer: &v1::DragOffer) -> bool {
-        let Ok(port) = u16::try_from(offer.bulk_port) else {
-            return false;
-        };
-        if port == 0 || offer.items.is_empty() {
-            return false;
-        }
-        let mut g = self.inner.lock().unwrap();
-        g.received.retain(|o| o.drag_id != offer.drag_id);
-        g.received.push_back(ReceivedOffer {
-            drag_id: offer.drag_id,
-            token: offer.token.clone(),
-            port,
-            names: offer.items.iter().map(|i| i.name.clone()).collect(),
-        });
-        while g.received.len() > MAX_OFFERS {
-            g.received.pop_front();
-        }
-        true
-    }
-
-    /// Fetches item `index` of the peer's drag `drag_id` to `destination`
-    /// (the path a drop target asked for). Blocks until the item is
-    /// committed, fails or is cancelled, and returns where it landed.
-    pub fn fetch(
-        &self,
-        drag_id: u64,
-        index: u32,
-        destination: &Path,
-    ) -> Result<PathBuf, TransferError> {
-        let (Some(dest_dir), Some(dest_name)) = (
-            destination.parent(),
-            destination.file_name().and_then(|n| n.to_str()),
-        ) else {
-            return Err(TransferError::InvalidManifest("目标位置无效".into()));
-        };
-        let (addr, if_index, token, name) = {
-            let g = self.inner.lock().unwrap();
-            let peer = g.peer.ok_or(TransferError::NotFound)?;
-            let offer = g
-                .received
-                .iter()
-                .find(|o| o.drag_id == drag_id)
-                .ok_or(TransferError::NotFound)?;
-            let name = offer
-                .names
-                .get(index as usize)
-                .ok_or(TransferError::NotFound)?
-                .clone();
-            (
-                SocketAddrV4::new(peer.ip, offer.port),
-                peer.if_index,
-                offer.token.clone(),
-                name,
-            )
-        };
-        let (id, progress) = self.register(Direction::Receive, &name, None)?;
-        let result = (|| {
-            let stream = connect(if_index, addr)?;
-            self.attach_socket(id, &stream);
-            if progress.is_cancelled() {
-                return Err(TransferError::Cancelled);
+        g.listener_port = None;
+        g.peer = None;
+        for offer in std::mem::take(&mut g.served) {
+            for item in offer.items.into_iter().flatten() {
+                finish_locked(
+                    &mut g,
+                    item.id,
+                    &Err(TransferError::Remote("连接已断开，请重新投放".into())),
+                );
             }
-            let mut w = BufWriter::new(stream.try_clone()?);
-            receive::send_request(
-                &mut w,
-                FetchRequest {
-                    drag_id,
-                    token,
-                    item_index: index,
-                },
-            )?;
-            w.flush()?;
-            let mut r = BufReader::with_capacity(SOCKET_BUFFER, stream);
-            receive::receive(&mut r, dest_dir, &name, dest_name, &progress)
+        }
+    }
+
+    /// Metadata has already been inspected off the input thread.
+    pub fn offer_files(
+        &self,
+        transfer_id: u64,
+        token: Vec<u8>,
+        port: u16,
+        paths: Vec<PathBuf>,
+        items: Vec<v1::DragItem>,
+    ) -> Result<v1::PortalOffer, TransferError> {
+        let offer = v1::PortalOffer {
+            transfer_id,
+            token: token.clone(),
+            bulk_port: port.into(),
+            items,
+        };
+        validate_offer(&offer)?;
+        if paths.len() != offer.items.len() {
+            return Err(TransferError::NotFound);
+        }
+        let mut g = self.inner.lock().unwrap();
+        ensure_capacity(&g, Direction::Send, paths.len())?;
+        let mut pending = Vec::new();
+        for (path, item) in paths.into_iter().zip(&offer.items) {
+            let (id, progress) = self.register_locked(&mut g, Direction::Send, &item.name);
+            pending.push(Some(OfferedItem { path, id, progress }));
+        }
+        g.served.push_back(ServedOffer {
+            drag_id: transfer_id,
+            token,
+            items: pending,
+        });
+        Ok(offer)
+    }
+
+    /// Reserves all rows before starting any work: capacity failure cannot
+    /// silently accept only part of a multi-file drop.
+    pub fn receive_offer(
+        &self,
+        offer: v1::PortalOffer,
+        downloads: PathBuf,
+    ) -> Result<(), TransferError> {
+        validate_offer(&offer)?;
+        if !downloads.is_absolute() {
+            return Err(TransferError::Remote("本机下载目录无效".into()));
+        }
+        let (peer, jobs) = {
+            let mut g = self.inner.lock().unwrap();
+            let peer = g.peer.ok_or(TransferError::NotFound)?;
+            if g.received.contains(&offer.transfer_id) {
+                // Idempotent replay: do not reject or cancel the original job.
+                return Ok(());
+            }
+            ensure_capacity(&g, Direction::Receive, offer.items.len())?;
+            let jobs: Vec<_> = offer
+                .items
+                .iter()
+                .map(|i| self.register_locked(&mut g, Direction::Receive, &i.name))
+                .collect();
+            g.received.push_back(offer.transfer_id);
+            while g.received.len() > MAX_OFFERS {
+                g.received.pop_front();
+            }
+            (peer, jobs)
+        };
+        for (index, (item, (id, progress))) in offer.items.into_iter().zip(jobs).enumerate() {
+            let this = self.clone();
+            let dest = downloads.clone();
+            let token = offer.token.clone();
+            let transfer_id = offer.transfer_id;
+            let port = offer.bulk_port as u16;
+            if let Err(e) = thread::Builder::new()
+                .name("osm-portal-receive".into())
+                .spawn(move || {
+                    let job = ReceiveJob {
+                        peer,
+                        port,
+                        request: FetchRequest {
+                            drag_id: transfer_id,
+                            token,
+                            item_index: index as u32,
+                        },
+                        downloads: dest,
+                        name: item.name,
+                        id,
+                        progress,
+                    };
+                    let result = this
+                        .fetch_item(&job)
+                        .map_err(|e| cancelled_or(e, &job.progress));
+                    this.finish(id, &result);
+                })
+            {
+                self.finish(id, &Err(e.into()));
+            }
+        }
+        Ok(())
+    }
+
+    fn fetch_item(&self, job: &ReceiveJob) -> Result<PathBuf, TransferError> {
+        let ReceiveJob {
+            peer,
+            port,
+            request,
+            downloads,
+            name,
+            id,
+            progress,
+        } = job;
+        if progress.is_cancelled() {
+            return Err(TransferError::Cancelled);
+        }
+        let stream = connect(peer.if_index, SocketAddrV4::new(peer.ip, *port))?;
+        self.attach_socket(*id, &stream);
+        if progress.is_cancelled() {
+            return Err(TransferError::Cancelled);
+        }
+        let mut w = BufWriter::new(stream.try_clone()?);
+        receive::send_request(&mut w, request.clone())?;
+        w.flush()?;
+        let mut r = BufReader::with_capacity(SOCKET_BUFFER, stream);
+        let result = (|| {
+            std::fs::create_dir_all(downloads)?;
+            receive::receive(&mut r, downloads, name, name, progress)
         })();
-        let result = result.map_err(|e| cancelled_or(e, &progress));
-        self.finish(id, &result);
+        // The sender reads this only after writing the payload. On a receive
+        // failure the connection may already be closed; success on this Mac
+        // still means a committed file, even if its receipt is lost.
+        let receipt = v1::BulkFrame {
+            body: Some(Body::Receipt(v1::TransferReceipt {
+                error: result
+                    .as_ref()
+                    .err()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+            })),
+        };
+        let _ = write_bulk(&mut w, &receipt, &mut Default::default()).and_then(|()| w.flush());
         result
+    }
+
+    pub fn reject_offer(&self, transfer_id: u64, message: &str) {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(pos) = g.served.iter().position(|o| o.drag_id == transfer_id) {
+            let offer = g.served.remove(pos).unwrap();
+            for item in offer.items.into_iter().flatten() {
+                finish_locked(
+                    &mut g,
+                    item.id,
+                    &Err(TransferError::Remote(message.chars().take(512).collect())),
+                );
+            }
+        }
+    }
+
+    pub fn expire_pending(&self) {
+        let mut g = self.inner.lock().unwrap();
+        let expired: Vec<_> = g
+            .active
+            .iter()
+            .filter(|a| {
+                a.direction == Direction::Send
+                    && a.finished_at.is_none()
+                    && a.socket.is_none()
+                    && (a.started.elapsed() >= IO_TIMEOUT || a.progress.is_cancelled())
+            })
+            .map(|a| (a.id, a.progress.is_cancelled()))
+            .collect();
+        for (id, cancelled) in expired {
+            for offer in &mut g.served {
+                for item in &mut offer.items {
+                    if item.as_ref().is_some_and(|i| i.id == id) {
+                        *item = None;
+                    }
+                }
+            }
+            let error = if cancelled {
+                TransferError::Cancelled
+            } else {
+                TransferError::Remote("对方未开始接收，请检查连接后重新投放".into())
+            };
+            finish_locked(&mut g, id, &Err(error));
+        }
+        g.served.retain(|o| o.items.iter().any(Option::is_some));
     }
 
     pub fn list(&self) -> Vec<TransferInfo> {
@@ -271,7 +369,13 @@ impl Transfers {
                 id: a.id,
                 direction: a.direction,
                 name: a.name.clone(),
-                progress: a.progress.snapshot(),
+                progress: {
+                    let mut p = a.progress.snapshot();
+                    if p.phase == osm_transfer::Phase::Finished && a.finished_at.is_none() {
+                        p.phase = osm_transfer::Phase::Committing;
+                    }
+                    p
+                },
                 error: a.error.clone(),
                 finished: a.finished_at.is_some(),
                 started: a.started,
@@ -320,23 +424,12 @@ impl Transfers {
         }
     }
 
-    fn register(
+    fn register_locked(
         &self,
+        g: &mut Inner,
         direction: Direction,
         name: &str,
-        socket: Option<&TcpStream>,
-    ) -> Result<(u64, Arc<Progress>), TransferError> {
-        let mut g = self.inner.lock().unwrap();
-        let running = g
-            .active
-            .iter()
-            .filter(|a| a.direction == direction && a.finished_at.is_none())
-            .count();
-        if running >= MAX_RUNNING {
-            // Far beyond what a drop produces; refuse instead of queueing
-            // unbounded threads.
-            return Err(TransferError::Limit("同时进行的传输过多".into()));
-        }
+    ) -> (u64, Arc<Progress>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let progress = Arc::new(Progress::new());
         g.active.push(Active {
@@ -344,13 +437,13 @@ impl Transfers {
             direction,
             name: name.to_owned(),
             progress: progress.clone(),
-            socket: socket.and_then(|s| s.try_clone().ok()),
+            socket: None,
             error: None,
             finished_at: None,
             started: Instant::now(),
             destination: None,
         });
-        Ok((id, progress))
+        (id, progress)
     }
 
     fn attach_socket(&self, id: u64, stream: &TcpStream) {
@@ -361,19 +454,7 @@ impl Transfers {
     }
 
     fn finish(&self, id: u64, result: &Result<PathBuf, TransferError>) {
-        let mut g = self.inner.lock().unwrap();
-        if let Some(a) = g.active.iter_mut().find(|a| a.id == id) {
-            a.finished_at = Some(Instant::now());
-            a.socket = None;
-            match result {
-                Ok(p) => a.destination = Some(p.clone()),
-                // A cancel the user asked for is not an error worth showing.
-                Err(TransferError::Cancelled) => {
-                    a.finished_at = Some(Instant::now() - KEEP_FINISHED);
-                }
-                Err(e) => a.error = Some(e.to_string()),
-            }
-        }
+        finish_locked(&mut self.inner.lock().unwrap(), id, result);
     }
 
     fn accept_loop(self, listener: TcpListener, generation: u64) {
@@ -413,42 +494,56 @@ impl Transfers {
             return;
         };
         let mut w = BufWriter::with_capacity(SOCKET_BUFFER, stream);
-        let req = match send::read_request(&mut BufReader::new(read_half)) {
+        let mut r = BufReader::new(read_half);
+        let req = match send::read_request(&mut r) {
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!("bad bulk request: {e}");
                 return;
             }
         };
-        let path = {
-            let g = self.inner.lock().unwrap();
-            g.served
-                .iter()
-                .find(|o| o.drag_id == req.drag_id && constant_time_eq(&o.token, &req.token))
-                .and_then(|o| o.paths.get(req.item_index as usize).cloned())
+        let Ok(cancel_socket) = w.get_ref().try_clone() else {
+            return;
         };
-        let Some(path) = path else {
+        let item = {
+            let mut g = self.inner.lock().unwrap();
+            let item = g
+                .served
+                .iter_mut()
+                .find(|o| o.drag_id == req.drag_id && constant_time_eq(&o.token, &req.token))
+                .and_then(|o| o.items.get_mut(req.item_index as usize))
+                .and_then(Option::take);
+            // Claim and mark running under one lock: a pending-offer timeout
+            // must not race the gap before a worker attaches its socket.
+            if let Some(item) = &item
+                && let Some(active) = g.active.iter_mut().find(|a| a.id == item.id)
+            {
+                active.socket = Some(cancel_socket);
+            }
+            item
+        };
+        let Some(item) = item else {
             send::refuse(&mut w, &TransferError::NotFound);
             let _ = w.flush();
             return;
         };
-        let name = osm_transfer::manifest::item_display_name(&path);
-        let Ok((id, progress)) = self.register(Direction::Send, &name, Some(w.get_ref())) else {
-            send::refuse(&mut w, &TransferError::Limit("同时进行的传输过多".into()));
-            let _ = w.flush();
-            return;
-        };
-        let result = send::serve(&mut w, &path, &progress).and_then(|()| {
+        let OfferedItem { path, id, progress } = item;
+        let _ = w.get_ref().set_read_timeout(Some(IO_TIMEOUT));
+        let result = (|| {
+            if progress.is_cancelled() {
+                return Err(TransferError::Cancelled);
+            }
+            send::serve(&mut w, &path, &progress)?;
             w.flush()?;
-            // Wait for the receiver to close first, so its last reads are
-            // not cut off by our close.
-            let _ = w.get_ref().shutdown(std::net::Shutdown::Write);
-            Ok(path.clone())
-        });
-        let result = result.map_err(|e| cancelled_or(e, &progress));
-        if let Err(e) = &result {
-            tracing::info!("serving a dragged item failed: {e}");
-        }
+            match read_bulk(&mut r, &mut Vec::new())? {
+                Body::Receipt(receipt) if receipt.error.is_empty() => Ok(path),
+                Body::Receipt(receipt) => Err(TransferError::Remote(
+                    receipt.error.chars().take(512).collect(),
+                )),
+                _ => Err(TransferError::Protocol("未收到对方保存文件的确认".into())),
+            }
+        })()
+        .map_err(|e| cancelled_or(e, &progress));
         self.finish(id, &result);
     }
 }
@@ -477,46 +572,324 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+fn validate_offer(offer: &v1::PortalOffer) -> Result<(), TransferError> {
+    if offer.bulk_port == 0 || offer.bulk_port > u16::MAX as u32 || offer.token.len() != 16 {
+        return Err(TransferError::Protocol("文件传送通道参数无效".into()));
+    }
+    if offer.items.is_empty() || offer.items.len() > MAX_RUNNING {
+        return Err(TransferError::Limit("每次最多 16 个文件或文件夹".into()));
+    }
+    for i in &offer.items {
+        if !osm_transfer::path::validate_macos_path(&i.name).is_ok_and(|p| p.len() == 1)
+            || !matches!(
+                v1::EntryKind::try_from(i.kind),
+                Ok(v1::EntryKind::File | v1::EntryKind::Directory | v1::EntryKind::Symlink)
+            )
+        {
+            return Err(TransferError::InvalidManifest("文件名或类型无效".into()));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_capacity(g: &Inner, direction: Direction, count: usize) -> Result<(), TransferError> {
+    if g.active
+        .iter()
+        .filter(|a| a.direction == direction && a.finished_at.is_none())
+        .count()
+        + count
+        > MAX_RUNNING
+    {
+        return Err(TransferError::Limit(
+            "传送通道忙，请等待当前传输完成后重试".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn finish_locked(g: &mut Inner, id: u64, result: &Result<PathBuf, TransferError>) {
+    if let Some(a) = g.active.iter_mut().find(|a| a.id == id) {
+        a.finished_at = Some(Instant::now());
+        a.socket = None;
+        match result {
+            Ok(p) if a.direction == Direction::Receive => a.destination = Some(p.clone()),
+            Ok(_) => {}
+            Err(e) => a.error = Some(e.to_string()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn token_compare() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"ab"));
+    struct Pair {
+        a: Transfers,
+        b: Transfers,
+        port: u16,
+    }
+    impl Pair {
+        fn new() -> Self {
+            let a = Transfers::new();
+            let b = Transfers::new();
+            // Interface 0 leaves the loopback test sockets unbound.
+            let port = a.connected(Ipv4Addr::LOCALHOST, 0).unwrap();
+            b.connected(Ipv4Addr::LOCALHOST, 0).unwrap();
+            a.peer_identified(2);
+            b.peer_identified(1);
+            Self { a, b, port }
+        }
+        fn offer(&self, paths: Vec<PathBuf>, id: u64) -> v1::PortalOffer {
+            let items = paths
+                .iter()
+                .map(|p| osm_transfer::describe_item(p).unwrap())
+                .collect();
+            self.a
+                .offer_files(id, vec![7; 16], self.port, paths, items)
+                .unwrap()
+        }
+    }
+    impl Drop for Pair {
+        fn drop(&mut self) {
+            self.a.cancel_all();
+            self.b.cancel_all();
+            self.a.disconnected();
+            self.b.disconnected();
+        }
+    }
+    fn wait_for(t: &Transfers, predicate: impl Fn(&[TransferInfo]) -> bool) -> Vec<TransferInfo> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let rows = t.list();
+            if predicate(&rows) {
+                return rows;
+            }
+            assert!(Instant::now() < deadline, "transfer stalled: {rows:?}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    fn finished(t: &Transfers, count: usize) -> Vec<TransferInfo> {
+        wait_for(t, |r| r.len() == count && r.iter().all(|r| r.finished))
     }
 
     #[test]
-    fn fetch_without_offer_is_not_found() {
-        let t = Transfers::new();
-        assert!(matches!(
-            t.fetch(1, 0, Path::new("/tmp/x")),
-            Err(TransferError::NotFound)
-        ));
+    fn portal_copies_files_and_folders_to_downloads_without_overwrite_or_replay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let downloads = tmp.path().join("Downloads");
+        std::fs::create_dir_all(source.join("文件夹/空目录")).unwrap();
+        std::fs::create_dir(&downloads).unwrap();
+        let payload = vec![42; osm_protocol::CHUNK_SIZE * 3 + 13];
+        std::fs::write(source.join("文件夹/payload.bin"), &payload).unwrap();
+        std::fs::write(source.join("zero.txt"), []).unwrap();
+        std::fs::write(downloads.join("zero.txt"), b"existing").unwrap();
+        let pair = Pair::new();
+        let offer = pair.offer(vec![source.join("文件夹"), source.join("zero.txt")], 10);
+        pair.b
+            .receive_offer(offer.clone(), downloads.clone())
+            .unwrap();
+        pair.b.receive_offer(offer, downloads.clone()).unwrap();
+        for rows in [finished(&pair.a, 2), finished(&pair.b, 2)] {
+            assert!(rows.iter().all(|r| r.error.is_none()), "{rows:?}");
+        }
+        assert_eq!(
+            std::fs::read(downloads.join("文件夹/payload.bin")).unwrap(),
+            payload
+        );
+        assert!(downloads.join("文件夹/空目录").is_dir());
+        assert_eq!(
+            std::fs::read(downloads.join("zero.txt")).unwrap(),
+            b"existing"
+        );
+        assert!(downloads.join("zero 2.txt").is_file());
+        assert_eq!(std::fs::read_dir(&downloads).unwrap().count(), 3);
+        assert_eq!(
+            std::fs::read(source.join("文件夹/payload.bin")).unwrap(),
+            payload
+        );
+        assert!(
+            pair.b
+                .list()
+                .iter()
+                .all(|r| r.destination.as_ref().unwrap().starts_with(&downloads))
+        );
+        assert!(pair.a.list().iter().all(|r| r.destination.is_none()));
+
+        // Reverse direction uses exactly the same receiver-selected path.
+        let reverse_downloads = tmp.path().join("OtherDownloads");
+        let path = downloads.join("zero.txt");
+        let port = pair.b.inner.lock().unwrap().listener_port.unwrap();
+        let offer = pair
+            .b
+            .offer_files(
+                11,
+                vec![8; 16],
+                port,
+                vec![path.clone()],
+                vec![osm_transfer::describe_item(&path).unwrap()],
+            )
+            .unwrap();
+        pair.a
+            .receive_offer(offer, reverse_downloads.clone())
+            .unwrap();
+        assert!(finished(&pair.a, 3).iter().all(|r| r.error.is_none()));
+        assert!(finished(&pair.b, 3).iter().all(|r| r.error.is_none()));
+        assert_eq!(
+            std::fs::read(reverse_downloads.join("zero.txt")).unwrap(),
+            b"existing"
+        );
     }
 
     #[test]
-    fn rejects_offer_without_port_or_items() {
-        let t = Transfers::new();
-        let mut offer = v1::DragOffer {
-            drag_id: 1,
-            epoch: 1,
+    fn sender_needs_commit_receipt_and_reports_rejection_or_missing_receipt() {
+        for receipt in [Some(""), Some("对方磁盘不可写"), None] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("file.txt");
+            std::fs::write(&path, b"payload").unwrap();
+            let dest = tmp.path().join("Downloads");
+            std::fs::create_dir(&dest).unwrap();
+            let pair = Pair::new();
+            let offer = pair.offer(vec![path], 20);
+            let stream = connect(0, SocketAddrV4::new(Ipv4Addr::LOCALHOST, pair.port)).unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            receive::send_request(
+                &mut writer,
+                FetchRequest {
+                    drag_id: offer.transfer_id,
+                    token: offer.token,
+                    item_index: 0,
+                },
+            )
+            .unwrap();
+            let mut reader = BufReader::new(stream);
+            receive::receive(&mut reader, &dest, "file.txt", "file.txt", &Progress::new()).unwrap();
+            let rows = wait_for(&pair.a, |r| {
+                r[0].progress.phase == osm_transfer::Phase::Committing
+            });
+            assert!(!rows[0].finished);
+            if let Some(error) = receipt {
+                write_bulk(
+                    &mut writer,
+                    &v1::BulkFrame {
+                        body: Some(Body::Receipt(v1::TransferReceipt {
+                            error: error.into(),
+                        })),
+                    },
+                    &mut Default::default(),
+                )
+                .unwrap();
+            } else {
+                writer.shutdown(std::net::Shutdown::Both).unwrap();
+            }
+            let rows = finished(&pair.a, 1);
+            assert_eq!(rows[0].error.is_none(), receipt == Some(""));
+            if receipt == Some("对方磁盘不可写") {
+                assert_eq!(rows[0].error.as_deref(), receipt);
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_unsafe_names_invalid_tokens_and_excess_items_before_writing() {
+        let valid = v1::PortalOffer {
+            transfer_id: 1,
             token: vec![1; 16],
-            bulk_port: 0,
+            bulk_port: 5000,
             items: vec![v1::DragItem {
-                name: "a".into(),
+                name: "ok".into(),
                 kind: v1::EntryKind::File as i32,
-                size: 1,
+                size: 0,
             }],
         };
-        assert!(!t.offer_received(&offer));
-        offer.bulk_port = 70_000;
-        assert!(!t.offer_received(&offer));
-        offer.bulk_port = 5000;
-        assert!(t.offer_received(&offer));
-        offer.items.clear();
-        assert!(!t.offer_received(&offer));
+        for name in ["/tmp/escape", "..", "../escape", "dir/file", "", "a\0b"] {
+            let mut offer = valid.clone();
+            offer.items[0].name = name.into();
+            assert!(validate_offer(&offer).is_err(), "accepted {name:?}");
+        }
+        for port in [0, 70_000] {
+            let mut offer = valid.clone();
+            offer.bulk_port = port;
+            assert!(validate_offer(&offer).is_err());
+        }
+        let mut offer = valid.clone();
+        offer.token.clear();
+        assert!(validate_offer(&offer).is_err());
+        let mut offer = valid.clone();
+        offer.items = vec![valid.items[0].clone(); 17];
+        assert!(validate_offer(&offer).is_err());
+        assert!(validate_offer(&valid).is_ok());
+    }
+
+    #[test]
+    fn pending_cancel_disconnect_reject_and_timeout_are_visible_failures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("file");
+        std::fs::write(&path, b"test").unwrap();
+        let pair = Pair::new();
+        pair.offer(vec![path.clone()], 30);
+        pair.a.cancel(pair.a.list()[0].id);
+        pair.a.expire_pending();
+        assert_eq!(pair.a.list()[0].error.as_deref(), Some("已取消"));
+        pair.offer(vec![path.clone()], 31);
+        pair.a.reject_offer(31, "对方共享已暂停");
+        assert_eq!(pair.a.list()[1].error.as_deref(), Some("对方共享已暂停"));
+        pair.offer(vec![path.clone()], 32);
+        pair.a.inner.lock().unwrap().active[2].started = Instant::now() - IO_TIMEOUT;
+        pair.a.expire_pending();
+        assert!(pair.a.list()[2].error.is_some());
+        pair.offer(vec![path], 33);
+        pair.a.disconnected();
+        assert!(
+            pair.a
+                .list()
+                .iter()
+                .all(|r| r.finished && r.error.is_some())
+        );
+        assert!(pair.a.inner.lock().unwrap().served.is_empty());
+    }
+
+    #[test]
+    fn invalid_downloads_directory_fails_without_creating_a_partial_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        std::fs::write(&source, b"test").unwrap();
+        let not_dir = tmp.path().join("blocked");
+        std::fs::write(&not_dir, b"keep").unwrap();
+        let pair = Pair::new();
+        let offer = pair.offer(vec![source], 40);
+        pair.b
+            .receive_offer(offer, not_dir.join("Downloads"))
+            .unwrap();
+        assert!(finished(&pair.b, 1)[0].error.is_some());
+        assert!(finished(&pair.a, 1)[0].error.is_some());
+        assert_eq!(std::fs::read(not_dir).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn capacity_rejection_does_not_partially_register_a_batch() {
+        let pair = Pair::new();
+        let mut g = pair.b.inner.lock().unwrap();
+        for _ in 0..15 {
+            pair.b.register_locked(&mut g, Direction::Receive, "busy");
+        }
+        drop(g);
+        let item = v1::DragItem {
+            name: "a".into(),
+            kind: v1::EntryKind::File as i32,
+            size: 0,
+        };
+        let offer = v1::PortalOffer {
+            transfer_id: 50,
+            token: vec![1; 16],
+            bulk_port: 5000,
+            items: vec![item.clone(), item],
+        };
+        assert!(
+            pair.b
+                .receive_offer(offer, PathBuf::from("/tmp/unused-downloads"))
+                .is_err()
+        );
+        assert_eq!(pair.b.list().len(), 15);
+        assert!(pair.b.inner.lock().unwrap().received.is_empty());
     }
 }

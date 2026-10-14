@@ -6,12 +6,12 @@ struct CoreBindingTests {
     @Test func buildInfoComesFromRust() {
         let info = buildInfo()
         #expect(info.protocolMajor == 1)
-        #expect(info.protocolMinor >= 1)
+        #expect(info.protocolMinor >= 2)
         #expect(info.defaultPort == 49001)
     }
 
     @Test func agentStartsLocal() {
-        let agent = Agent(deviceName: "test", overlay: nil)
+        let agent = Agent(deviceName: "test", downloadsDirectory: "/tmp/osm-binding-downloads")
         let status = agent.status()
         #expect(status.role == .local)
         #expect(status.sharingEnabled)

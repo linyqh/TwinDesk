@@ -40,7 +40,7 @@ let package = Package(
         ),
         .testTarget(
             name: "OpenShareMouseTests",
-            dependencies: ["OSMCore"],
+            dependencies: ["OSMCore", "OpenShareMouse"],
             path: "Tests/OpenShareMouseTests"
         ),
     ]

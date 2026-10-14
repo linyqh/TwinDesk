@@ -14,14 +14,19 @@ final class AppModel {
     let build: BuildInfo = buildInfo()
 
     private let agent: Agent
-    private let dragBridge = DragBridge()
+    private var portal: TransferPortal?
+    private(set) var preparingTransfer = false
+    private(set) var transferError: String?
+    let downloadsDirectory: URL
     private var refreshTask: Task<Void, Never>?
 
     init() {
         let name = Host.current().localizedName ?? "Mac"
-        agent = Agent(deviceName: name, overlay: dragBridge)
-        dragBridge.agent = agent
+        downloadsDirectory = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads", isDirectory: true)
+        agent = Agent(deviceName: name, downloadsDirectory: downloadsDirectory.path)
         status = agent.status()
+        portal = TransferPortal { [weak self] urls in self?.sendFiles(urls) }
         refreshTask = Task { [weak self] in
             while !Task.isCancelled {
                 self?.refresh()
@@ -41,8 +46,42 @@ final class AppModel {
             agent.retryCapture()
         }
         status = agent.status()
+        let previouslyDone = Set(transfers.filter { $0.phase == .finished || $0.phase == .failed }.map(\.id))
         transfers = agent.transfers()
+        if let recent = transfers.last(where: {
+            ($0.phase == .finished || $0.phase == .failed) && !previouslyDone.contains($0.id)
+        }) {
+            let failed = recent.phase == .failed
+            portal?.showResult(failed ? "传输失败，查看主窗口" : recent.direction == .sending ? "对方已保存" : "已存入下载目录", failed: failed)
+        }
+        portal?.update(status: status, preparing: preparingTransfer, activeCount: activeTransfers.count)
     }
+
+    func sendFiles(_ urls: [URL]) {
+        guard !preparingTransfer else { return }
+        preparingTransfer = true
+        transferError = nil
+        let agent = agent
+        let paths = urls.map(\.path)
+        Task { [weak self] in
+            let error: String? = await Task.detached {
+                do { try agent.sendFiles(paths: paths); return nil }
+                catch let error as SendFilesError {
+                    switch error {
+                    case .Failed(let message): return message
+                    case .Cancelled: return "已取消"
+                    }
+                } catch { return error.localizedDescription }
+            }.value
+            guard let self else { return }
+            preparingTransfer = false
+            transferError = error
+            portal?.showResult(error == nil ? "已提交传输" : "发送失败，查看主窗口", failed: error != nil)
+            refresh()
+        }
+    }
+
+    func openDownloads() { NSWorkspace.shared.open(downloadsDirectory) }
 
     var connectedPort: PortInfo? {
         status.ports.first { $0.connected && $0.ipService }

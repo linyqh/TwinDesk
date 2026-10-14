@@ -40,8 +40,8 @@ pub enum Effect {
         at: LogicalPoint,
     },
     /// Release everything injected and return to local mode. `handoff` is
-    /// set when the cursor left through the return edge, so a drag in
-    /// progress continues on the peer; otherwise the session was aborted.
+    /// set when the cursor left through the return edge; otherwise the
+    /// session was aborted. Held-button drags cannot leave through an edge.
     EndControlled {
         handoff: bool,
     },
@@ -86,6 +86,7 @@ pub struct Router {
     fn_restore: FnRestore,
     /// Epoch of the most recent session in either role.
     last_epoch: u64,
+    remote_left_down: bool,
 }
 
 impl Router {
@@ -101,6 +102,7 @@ impl Router {
             sharing_enabled: true,
             fn_restore: FnRestore::default(),
             last_epoch: 0,
+            remote_left_down: false,
         }
     }
 
@@ -181,8 +183,17 @@ impl Router {
             // and tell the peer.
             (_, InputEvent::TapDisabled) => self.abort(),
 
-            (Role::Local, InputEvent::LocalMove { pos, dx, .. }) => {
-                if !self.sharing_enabled || !self.desktop.at_edge(self.peer_side, pos, dx) {
+            (
+                Role::Local,
+                InputEvent::LocalMove {
+                    pos, dx, left_down, ..
+                },
+            ) => {
+                // Complete local drops before handing input to another computer.
+                if left_down
+                    || !self.sharing_enabled
+                    || !self.desktop.at_edge(self.peer_side, pos, dx)
+                {
                     return Vec::new();
                 }
                 let epoch = self.next_epoch;
@@ -298,6 +309,7 @@ impl Router {
                 self.role = Role::Controlled { epoch: e.epoch };
                 self.last_epoch = e.epoch;
                 self.remote_pos = self.desktop.entry_point(side, e.y_ratio);
+                self.remote_left_down = false;
                 vec![Effect::BeginControlled {
                     at: self.remote_pos,
                 }]
@@ -325,12 +337,10 @@ impl Router {
                     x: self.remote_pos.x + m.dx as f64,
                     y: self.remote_pos.y + m.dy as f64,
                 };
-                if self.desktop.beyond_edge(self.peer_side, raw) {
+                if !self.remote_left_down && self.desktop.beyond_edge(self.peer_side, raw) {
                     let y_ratio = self.desktop.y_ratio(raw);
                     self.role = Role::Local;
-                    // Leave first: a drag carried across is offered while
-                    // handling EndControlled, and the peer must already be
-                    // local when the offer arrives.
+                    // Notify the controller before restoring local input.
                     return vec![
                         Effect::Send(leave(epoch, y_ratio, LeaveReason::Edge)),
                         Effect::EndControlled { handoff: true },
@@ -344,6 +354,9 @@ impl Router {
                 }]
             }
             (Role::Controlled { .. }, P::MouseButton(b)) => {
+                if b.button == 0 {
+                    self.remote_left_down = b.down;
+                }
                 vec![Effect::InjectButton {
                     button: b.button,
                     down: b.down,
@@ -429,6 +442,59 @@ mod tests {
             panic!("not controlling: {fx:?}")
         };
         epoch
+    }
+
+    #[test]
+    fn local_drag_stays_on_source_until_released_on_either_edge() {
+        for (side, x, dx) in [(Side::Left, 0.0, -20.0), (Side::Right, 999.0, 20.0)] {
+            let mut r = Router::new(desktop(), side);
+            assert!(
+                r.on_local(InputEvent::LocalMove {
+                    pos: pt(x, 400.0),
+                    dx,
+                    dy: 0.0,
+                    left_down: true,
+                })
+                .is_empty()
+            );
+            assert_eq!(r.role(), Role::Local);
+            assert!(
+                !r.on_local(InputEvent::LocalMove {
+                    pos: pt(x, 400.0),
+                    dx,
+                    dy: 0.0,
+                    left_down: false,
+                })
+                .is_empty()
+            );
+            assert!(matches!(r.role(), Role::Controlling { .. }));
+        }
+    }
+
+    #[test]
+    fn remotely_driven_drag_can_drop_on_portal_without_returning_control() {
+        for (side, dx) in [(v1::Side::Left, -2000), (v1::Side::Right, 2000)] {
+            let mut r = controlled(side);
+            r.on_peer(P::MouseButton(v1::MouseButton {
+                button: 0,
+                down: true,
+                ..Default::default()
+            }));
+            let fx = r.on_peer(P::MouseMove(v1::MouseMove { dx, dy: 0 }));
+            assert!(matches!(&fx[..], [Effect::InjectMove { .. }]));
+            assert!(matches!(r.role(), Role::Controlled { .. }));
+            let fx = r.on_peer(P::MouseButton(v1::MouseButton {
+                button: 0,
+                down: false,
+                ..Default::default()
+            }));
+            assert!(matches!(
+                &fx[..],
+                [Effect::InjectButton { down: false, .. }]
+            ));
+            r.on_peer(P::MouseMove(v1::MouseMove { dx, dy: 0 }));
+            assert_eq!(r.role(), Role::Local);
+        }
     }
 
     #[test]

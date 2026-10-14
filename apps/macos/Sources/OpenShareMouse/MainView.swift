@@ -159,11 +159,23 @@ private struct TransferSection: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
-        Section("文件拖拽") {
+        Section("文件传送通道") {
             if model.transfers.isEmpty {
-                Text("控制对方电脑时，直接把文件从本机的访达拖过屏幕边缘，放到对方的访达窗口或桌面即可复制过去；反过来也一样。文件只经雷雳数据线传输。")
+                Text("把文件或文件夹拖到屏幕朝向对方一侧的“传送通道”，松手后复制到对方的下载目录（Downloads）。每次最多 16 项；更多文件可先放入一个文件夹。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+            HStack {
+                Text("接收位置：本机下载目录").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button("打开下载目录") { model.openDownloads() }.buttonStyle(.link)
+            }
+            if model.status.link == .connected && !model.status.portalAvailable {
+                Text("传送通道尚未就绪，请确认两端均已更新且共享已开启。")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+            if let error = model.transferError {
+                Text(error).font(.caption).foregroundStyle(.red)
             }
             ForEach(model.transfers, id: \.id) { t in
                 TransferRow(transfer: t)
@@ -232,7 +244,7 @@ private struct TransferRow: View {
                 text += " · \(transfer.doneFiles)/\(transfer.totalFiles) 个文件"
             }
             return text
-        case .committing: return "正在校验并保存…"
+        case .committing: return transfer.direction == .sending ? "等待对方确认保存…" : "正在校验并保存…"
         case .finished: return "已\(verb) \(total)"
         case .failed: return transfer.error ?? "传输失败"
         }

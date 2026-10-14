@@ -41,6 +41,8 @@ message Envelope {
 
     DragOffer drag_offer = 64;
     DragEnd drag_end = 65;
+    PortalOffer portal_offer = 66;
+    PortalReject portal_reject = 67;
   }
 }
 
@@ -125,7 +127,7 @@ message Key {
   uint64 flags = 4;
 }
 
-// ---- Drag and drop (report §10) ----------------------------------------
+// ---- File transfer (report §10) ----------------------------------------
 
 enum EntryKind {
   ENTRY_KIND_UNSPECIFIED = 0;
@@ -142,6 +144,7 @@ message DragItem {
   uint64 size = 3;
 }
 
+// Legacy minor 1 only; minor 2 receivers reject this native drag flow.
 // Origin -> peer, right after the Enter or Leave that carried the cursor
 // across while a file drag was in progress. The peer starts a native drag
 // of file promises; contents are only fetched once something accepts the
@@ -162,13 +165,34 @@ message DragEnd {
   bool dropped = 2;
 }
 
+// Protocol minor 2: a local drop explicitly sends files to the peer's
+// Downloads directory. No input epoch or remote drag session is involved.
+message PortalOffer {
+  uint64 transfer_id = 1;
+  bytes token = 2;
+  uint32 bulk_port = 3;
+  repeated DragItem items = 4;
+}
+
+message PortalReject {
+  uint64 transfer_id = 1;
+  string message = 2;
+}
+
+// Receiver -> sender, after verification and atomic commit. An empty error
+// means the file is saved; EOF alone must never count as success.
+message TransferReceipt {
+  string error = 1;
+}
+
 // ---- Bulk connection -----------------------------------------------------
 //
 // Frames are `u32_be length + BulkFrame`. The receiver sends one
 // FetchRequest; the sender answers with the manifest pages, ManifestEnd,
 // then for every FILE entry in manifest order its FileChunks followed by
 // FileEnd, and finally TransferDone. TransferFailed may replace any frame
-// after the request. Either side cancels by closing the connection.
+// after the request. Minor 2 receivers answer TransferDone with a
+// TransferReceipt after commit. Either side cancels by closing the connection.
 
 message BulkFrame {
   oneof body {
@@ -179,6 +203,7 @@ message BulkFrame {
     FileEnd file_end = 5;
     TransferDone done = 6;
     TransferFailed failed = 7;
+    TransferReceipt receipt = 8;
   }
 }
 

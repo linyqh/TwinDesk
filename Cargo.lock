@@ -477,6 +477,7 @@ dependencies = [
  "osm-protocol",
  "osm-transfer",
  "osm-transport",
+ "tempfile",
  "tracing",
 ]
 

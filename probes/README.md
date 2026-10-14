@@ -10,7 +10,7 @@
 | P0-02 | 注入键鼠事件：用 `eventSourceUserData` 标记防回环；`*MouseDragged` 和双击 `clickState`；修饰键 flags | PLAT-01 | 未开始 |
 | P0-03 | 源端光标冻结与隐藏：`CGAssociateMouseAndMouseCursorPosition` 加 `SetsCursorInBackground`；光标在 Dock、菜单栏、全屏应用上时的表现 | §8.3 | 未开始 |
 | P0-04 | 按住 Shift 或鼠标键时 `kill -9` 目标端，检查是否卡键；检查源端光标能否恢复 | U07, §14.2 | 未开始 |
-| P0-05 | 从 Finder 拖文件越过屏幕边缘：能否读到拖拽剪贴板；目标端 NSFilePromiseProvider 发起系统拖拽 | U01, F24 | 未开始 |
+| P0-05 | Finder 文件投放到本机边缘通道，另一台 Mac 保存到 Downloads；本机鼠标与远端注入鼠标均需验证（替代原生拖拽接续，见 ADR-0002） | U01, F24 | 实验：自动测试已通过，双机验收待完成 |
 | P0-06 | 剪贴板隐私：`accessBehavior`；开启 `EnablePasteboardPrivacyDeveloperPreview` 后远端粘贴的表现 | F22 | 未开始 |
 | P0-07 | 本地网络权限弹窗与授权；签名变化或升级后授权是否保留 | §7.1 | 未开始 |
 | P0-08 | 缩放和旋转手势合成在 macOS 27 上是否仍然有效（可能需要附带 IOHIDEvent） | F10, AT05 | 未开始 |
