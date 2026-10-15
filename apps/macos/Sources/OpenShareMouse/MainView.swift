@@ -6,34 +6,79 @@ struct MainView: View {
 
     var body: some View {
         Form {
-            Section {
-                HStack(spacing: 12) {
-                    BrandIcon(size: 56)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("同桌 · TwinDesk").font(.title2.bold())
-                        Text("共享键鼠，轻松传文件")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
+            StatusHeader()
             if !model.allPermissionsGranted || model.status.captureError != nil {
                 PermissionSection()
             }
-            CableSection()
-            PeerSection()
             ControlSection()
             TransferSection()
             if let error = model.status.lastError {
                 Section {
                     Label(error, systemImage: "exclamationmark.circle")
                         .foregroundStyle(.secondary)
+                        .wrapping()
                 }
             }
         }
         .formStyle(.grouped)
-        .frame(width: 480)
+        .frame(width: 420)
         .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+// MARK: - Header
+
+private struct StatusHeader: View {
+    @Environment(AppModel.self) private var model
+    @State private var showingDetails = false
+
+    var body: some View {
+        Section {
+            HStack(spacing: 12) {
+                BrandIcon(size: 44)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("同桌 · TwinDesk").font(.headline)
+                    HStack(spacing: 6) {
+                        Image(systemName: "circle.fill")
+                            .font(.system(size: 7))
+                            .foregroundStyle(Color(nsColor: model.linkColor))
+                        Text(summary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .layoutPriority(-1)
+                    }
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                if model.status.link == .cableNoNetwork {
+                    Button("网络设置…") { model.openNetworkSettings() }
+                }
+                Button {
+                    showingDetails.toggle()
+                } label: {
+                    Image(systemName: "info.circle").font(.title3)
+                }
+                .buttonStyle(.borderless)
+                .help("连接详情")
+                .popover(isPresented: $showingDetails, arrowEdge: .bottom) {
+                    Form {
+                        CableSection()
+                        PeerSection()
+                    }
+                    .formStyle(.grouped)
+                    .frame(width: 360)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .environment(model)
+                }
+            }
+        }
+    }
+
+    private var summary: String {
+        guard model.status.link == .connected, let peer = model.status.peer else { return model.linkTitle }
+        guard let ms = model.status.latencyMs else { return "已连接 \(peer.name)" }
+        return "已连接 \(peer.name) · " + String(format: "%.1f ms", ms)
     }
 }
 
@@ -44,11 +89,12 @@ private struct CableSection: View {
 
     var body: some View {
         Section("雷雳数据线") {
-            HStack(spacing: 10) {
-                Circle()
-                    .fill(Color(nsColor: model.linkColor))
-                    .frame(width: 10, height: 10)
+            Label {
                 Text(model.linkTitle).font(.headline)
+            } icon: {
+                Image(systemName: "circle.fill")
+                    .font(.system(size: 9))
+                    .foregroundStyle(Color(nsColor: model.linkColor))
             }
 
             if let port = model.connectedPort {
@@ -73,7 +119,7 @@ private struct CableSection: View {
             }
 
             if let error = model.status.hardwareError {
-                Text(error).font(.caption).foregroundStyle(.red)
+                Text(error).font(.caption).foregroundStyle(.red).wrapping()
             }
 
             DisclosureGroup("全部雷雳端口") {
@@ -130,13 +176,13 @@ private struct ControlSection: View {
 
     var body: some View {
         @Bindable var model = model
-        Section("键盘与鼠标共享") {
+        Section {
             Toggle("启用共享", isOn: Binding(
                 get: { model.status.sharingEnabled },
                 set: { model.setSharingEnabled($0) }
             ))
 
-            Picker("对方电脑位于本机的", selection: Binding(
+            Picker("对方电脑位置", selection: Binding(
                 get: { model.status.peerSide },
                 set: { model.setPeerSide($0) }
             )) {
@@ -153,13 +199,11 @@ private struct ControlSection: View {
             if model.status.role != .local {
                 Button("回到本机") { model.returnToLocal() }
             }
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text("把鼠标移出屏幕\(model.status.peerSide == .left ? "左" : "右")边缘即可控制对方电脑，从对方屏幕的另一侧移回来即可回到本机。")
-                Text("紧急情况下按 ⌃⌘⎋（Control-Command-Esc）立即回到本机。")
-            }
-            .font(.caption)
-            .foregroundStyle(.secondary)
+        } header: {
+            Text("键盘与鼠标共享")
+        } footer: {
+            Text("鼠标移出屏幕\(model.status.peerSide == .left ? "左" : "右")边缘即控制对方；按 ⌃⌘⎋ 立即回到本机。")
+                .formFooterStyle()
         }
     }
 }
@@ -170,27 +214,30 @@ private struct TransferSection: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
-        Section("文件传送通道") {
-            if model.transfers.isEmpty {
-                Text("把文件或文件夹拖到屏幕朝向对方一侧的“传送通道”，松手后复制到对方的下载目录（Downloads）。每次最多 16 项；更多文件可先放入一个文件夹。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            HStack {
-                Text("接收位置：本机下载目录").font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                Button("打开下载目录") { model.openDownloads() }.buttonStyle(.link)
+        Section {
+            LabeledContent("接收位置") {
+                Button("下载目录", systemImage: "folder") { model.openDownloads() }
             }
             if model.status.link == .connected && !model.status.portalAvailable {
-                Text("传送通道尚未就绪，请确认两端均已更新且共享已开启。")
-                    .font(.caption).foregroundStyle(.orange)
+                Label("传送通道尚未就绪，请确认两端均已更新且共享已开启。", systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+                    .wrapping()
             }
             if let error = model.transferError {
-                Text(error).font(.caption).foregroundStyle(.red)
+                Label(error, systemImage: "xmark.octagon.fill")
+                    .font(.callout)
+                    .foregroundStyle(.red)
+                    .wrapping()
             }
             ForEach(model.transfers, id: \.id) { t in
                 TransferRow(transfer: t)
             }
+        } header: {
+            Text("文件传送")
+        } footer: {
+            Text("拖动文件时，屏幕\(model.status.peerSide == .left ? "左" : "右")侧会出现传送通道，松手即发送。每次最多 16 项。")
+                .formFooterStyle()
         }
     }
 }
@@ -202,8 +249,9 @@ private struct TransferRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Image(systemName: transfer.direction == .sending ? "arrow.up.doc" : "arrow.down.doc")
-                    .foregroundStyle(.secondary)
+                Image(systemName: icon)
+                    .foregroundStyle(transfer.phase == .failed ? AnyShapeStyle(.red) : AnyShapeStyle(.secondary))
+                    .contentTransition(.symbolEffect(.replace))
                 Text(transfer.name).lineLimit(1).truncationMode(.middle)
                 Spacer()
                 switch transfer.phase {
@@ -226,11 +274,20 @@ private struct TransferRow: View {
             }
             if transfer.phase != .finished && transfer.phase != .failed {
                 ProgressView(value: fraction)
+                    .controlSize(.small)
             }
             Text(detail)
                 .font(.caption)
                 .foregroundStyle(transfer.phase == .failed ? .red : .secondary)
                 .lineLimit(2)
+        }
+    }
+
+    private var icon: String {
+        switch transfer.phase {
+        case .finished: "checkmark.circle.fill"
+        case .failed: "exclamationmark.circle.fill"
+        default: transfer.direction == .sending ? "arrow.up.doc" : "arrow.down.doc"
         }
     }
 
@@ -269,32 +326,43 @@ private struct PermissionSection: View {
 
     var body: some View {
         Section {
-            Label("需要“辅助功能”权限才能共享键盘和鼠标", systemImage: "lock.shield")
-                .font(.headline)
-            PermissionRow(title: "辅助功能", granted: model.permissions.accessibility)
-            PermissionRow(title: "发送事件", granted: model.permissions.postEvents)
-            HStack {
-                Button("请求权限") { model.requestPermissions() }
-                Button("打开“辅助功能”设置…") { model.openPrivacySettings(.accessibility) }
-                Spacer()
-                Button("重试") { model.retryCapture() }
+            VStack(alignment: .leading, spacing: 6) {
+                Label("需要“辅助功能”权限", systemImage: "exclamationmark.triangle.fill")
+                    .font(.headline)
+                    .foregroundStyle(.orange)
+                Text(model.status.captureError ?? "授权后点“重试”；若仍不生效，请重新打开 同桌 · TwinDesk。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .wrapping()
+                HStack {
+                    Button("打开设置…") {
+                        model.requestPermissions()
+                        model.openPrivacySettings(.accessibility)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    Button("重试") { model.retryCapture() }
+                }
+                .controlSize(.small)
+                .padding(.top, 2)
             }
-            if let error = model.status.captureError {
-                Text(error).font(.caption).foregroundStyle(.red)
-            }
-            Text("授权后点“重试”；若仍不生效，请退出并重新打开 同桌 · TwinDesk。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }
 
-private struct PermissionRow: View {
-    let title: String
-    let granted: Bool
+private extension View {
+    func formFooterStyle() -> some View {
+        font(.caption)
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.leading)
+            .wrapping()
+            .padding(.horizontal, 10)
+    }
 
-    var body: some View {
-        Label(title, systemImage: granted ? "checkmark.circle.fill" : "xmark.circle")
-            .foregroundStyle(granted ? .green : .red)
+    /// A grouped Form sizes itself to its widest row's ideal width, so long
+    /// text must report a modest ideal width to wrap instead of widening it.
+    func wrapping() -> some View {
+        fixedSize(horizontal: false, vertical: true)
+            .frame(idealWidth: 280, maxWidth: .infinity, alignment: .leading)
     }
 }
