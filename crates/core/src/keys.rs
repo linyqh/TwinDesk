@@ -4,6 +4,7 @@
 //! direction is whether the key's flag is set in the new flags.
 
 pub const KEY_ESCAPE: u16 = 53;
+pub const KEY_CAPS_LOCK: u16 = 57;
 pub const KEY_FUNCTION: u16 = 63;
 
 pub const FLAG_ALPHA_SHIFT: u64 = 0x0001_0000;
@@ -12,6 +13,13 @@ pub const FLAG_CONTROL: u64 = 0x0004_0000;
 pub const FLAG_ALTERNATE: u64 = 0x0008_0000;
 pub const FLAG_COMMAND: u64 = 0x0010_0000;
 pub const FLAG_SECONDARY_FN: u64 = 0x0080_0000;
+/// Physical Caps Lock state, distinct from the latched AlphaShift state.
+pub const FLAG_CAPS_LOCK_HELD: u64 = 0x0100_0080;
+
+/// Preserve the target's lock state, never copy it from the controller.
+pub fn target_caps_flags(remote: u64, target: u64) -> u64 {
+    (remote & !(FLAG_ALPHA_SHIFT | FLAG_CAPS_LOCK_HELD)) | (target & FLAG_ALPHA_SHIFT)
+}
 
 /// Flag bit owned by a modifier keycode, or `None` for ordinary keys.
 pub fn modifier_flag(keycode: u16) -> Option<u64> {
@@ -20,7 +28,7 @@ pub fn modifier_flag(keycode: u16) -> Option<u64> {
         59 | 62 => Some(FLAG_CONTROL),
         58 | 61 => Some(FLAG_ALTERNATE),
         55 | 54 => Some(FLAG_COMMAND),
-        57 => Some(FLAG_ALPHA_SHIFT),
+        KEY_CAPS_LOCK => Some(FLAG_CAPS_LOCK_HELD),
         KEY_FUNCTION => Some(FLAG_SECONDARY_FN),
         _ => None,
     }
@@ -120,6 +128,29 @@ mod tests {
     fn fn_is_a_modifier() {
         assert!(modifier_is_down(KEY_FUNCTION, FLAG_SECONDARY_FN));
         assert!(!modifier_is_down(KEY_FUNCTION, 0));
+    }
+
+    #[test]
+    fn caps_lock_pressed_state_is_not_the_latched_lock_state() {
+        assert!(!modifier_is_down(KEY_CAPS_LOCK, FLAG_ALPHA_SHIFT));
+        assert!(modifier_is_down(KEY_CAPS_LOCK, FLAG_CAPS_LOCK_HELD));
+        assert!(modifier_is_down(
+            KEY_CAPS_LOCK,
+            FLAG_CAPS_LOCK_HELD | FLAG_ALPHA_SHIFT
+        ));
+    }
+
+    #[test]
+    fn controller_caps_state_never_overrides_target_lock() {
+        assert_eq!(
+            target_caps_flags(FLAG_ALPHA_SHIFT | FLAG_SHIFT | FLAG_CAPS_LOCK_HELD, 0),
+            FLAG_SHIFT
+        );
+        assert_eq!(
+            target_caps_flags(FLAG_COMMAND, FLAG_ALPHA_SHIFT),
+            FLAG_COMMAND | FLAG_ALPHA_SHIFT
+        );
+        assert_eq!(target_caps_flags(0, FLAG_ALPHA_SHIFT), FLAG_ALPHA_SHIFT);
     }
 
     #[test]

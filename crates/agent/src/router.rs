@@ -7,7 +7,7 @@
 use osm_core::keys::{FLAG_COMMAND, FLAG_CONTROL, FnRestore, KEY_ESCAPE, KeyStroke};
 use osm_core::{Desktop, Side};
 use osm_model::LogicalPoint;
-use osm_platform_macos::{InputEvent, REMAPPED_FN_KEYCODE};
+use osm_platform_macos::{InputEvent, REMAPPED_CAPS_LOCK_KEYCODE, REMAPPED_FN_KEYCODE};
 use osm_protocol::v1::{self, LeaveReason};
 
 /// Ctrl+Cmd+Esc while controlling the peer returns control immediately,
@@ -62,6 +62,9 @@ pub enum Effect {
         scroll_phase: u32,
         momentum_phase: u32,
     },
+    CapsLock {
+        down: bool,
+    },
     InjectKey {
         keycode: u16,
         down: bool,
@@ -87,6 +90,7 @@ pub struct Router {
     /// Epoch of the most recent session in either role.
     last_epoch: u64,
     remote_left_down: bool,
+    caps_lock_forwarding: bool,
 }
 
 impl Router {
@@ -103,6 +107,7 @@ impl Router {
             fn_restore: FnRestore::default(),
             last_epoch: 0,
             remote_left_down: false,
+            caps_lock_forwarding: false,
         }
     }
 
@@ -175,6 +180,10 @@ impl Router {
         };
         self.role = Role::Local;
         fx
+    }
+
+    pub fn set_caps_lock_forwarding(&mut self, enabled: bool) {
+        self.caps_lock_forwarding = enabled;
     }
 
     pub fn on_local(&mut self, ev: InputEvent) -> Vec<Effect> {
@@ -263,6 +272,19 @@ impl Router {
                         scroll_phase,
                         momentum_phase,
                     }))]
+                }
+                InputEvent::Key {
+                    keycode: REMAPPED_CAPS_LOCK_KEYCODE,
+                    down,
+                    repeat,
+                    ..
+                } if self.caps_lock_forwarding => {
+                    if repeat {
+                        return Vec::new();
+                    }
+                    vec![Effect::Send(v1::envelope::Payload::CapsLock(
+                        v1::CapsLock { epoch, down },
+                    ))]
                 }
                 InputEvent::Key {
                     keycode,
@@ -370,6 +392,9 @@ impl Router {
                 scroll_phase: s.scroll_phase,
                 momentum_phase: s.momentum_phase,
             }],
+            (Role::Controlled { epoch }, P::CapsLock(k)) if k.epoch == epoch => {
+                vec![Effect::CapsLock { down: k.down }]
+            }
             (Role::Controlled { .. }, P::Key(k)) => {
                 let Ok(keycode) = u16::try_from(k.keycode) else {
                     return Vec::new();
@@ -622,6 +647,73 @@ mod tests {
             panic!("{fx:?}")
         };
         assert_eq!(k.flags & FLAG_SECONDARY_FN, FLAG_SECONDARY_FN);
+    }
+
+    #[test]
+    fn caps_lock_round_trip_is_scoped_to_the_active_session() {
+        let mut sender = Router::new(desktop(), Side::Right);
+        let epoch = start_controlling(&mut sender);
+        sender.set_caps_lock_forwarding(true);
+        let mut target = Router::new(desktop(), Side::Left);
+        target.on_peer(P::Enter(v1::Enter {
+            epoch,
+            return_side: v1::Side::Left as i32,
+            y_ratio: 0.5,
+        }));
+        for down in [true, false] {
+            let fx = sender.on_local(InputEvent::Key {
+                keycode: REMAPPED_CAPS_LOCK_KEYCODE,
+                down,
+                repeat: false,
+                flags: osm_core::keys::FLAG_ALPHA_SHIFT,
+            });
+            let [Effect::Send(payload)] = &fx[..] else {
+                panic!("{fx:?}")
+            };
+            assert_eq!(
+                target.on_peer(payload.clone()),
+                vec![Effect::CapsLock { down }]
+            );
+        }
+        assert!(
+            sender
+                .on_local(InputEvent::Key {
+                    keycode: REMAPPED_CAPS_LOCK_KEYCODE,
+                    down: true,
+                    repeat: true,
+                    flags: 0,
+                })
+                .is_empty()
+        );
+        assert!(
+            target
+                .on_peer(P::CapsLock(v1::CapsLock {
+                    epoch: epoch + 1,
+                    down: true
+                }))
+                .is_empty()
+        );
+        target.disconnected();
+        assert!(
+            target
+                .on_peer(P::CapsLock(v1::CapsLock { epoch, down: false }))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn old_peer_does_not_reserve_f18_or_receive_caps_messages() {
+        let mut r = Router::new(desktop(), Side::Right);
+        start_controlling(&mut r);
+        let fx = r.on_local(InputEvent::Key {
+            keycode: REMAPPED_CAPS_LOCK_KEYCODE,
+            down: true,
+            repeat: false,
+            flags: 0,
+        });
+        assert!(
+            matches!(&fx[..], [Effect::Send(P::Key(k))] if k.keycode == u32::from(REMAPPED_CAPS_LOCK_KEYCODE))
+        );
     }
 
     #[test]

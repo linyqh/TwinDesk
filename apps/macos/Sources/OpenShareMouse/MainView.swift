@@ -6,6 +6,17 @@ struct MainView: View {
 
     var body: some View {
         Form {
+            Section {
+                HStack(spacing: 12) {
+                    BrandIcon(size: 56)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("同桌 · TwinDesk").font(.title2.bold())
+                        Text("共享键鼠，轻松传文件")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
             if !model.allPermissionsGranted || model.status.captureError != nil {
                 PermissionSection()
             }
@@ -104,8 +115,8 @@ private struct PeerSection: View {
                 }
             } else {
                 Text(model.status.link == .noCable
-                     ? "用雷雳数据线连接另一台 Mac 后，在两台电脑上都运行 OpenShareMouse。"
-                     : "等待对方电脑上的 OpenShareMouse 响应…")
+                     ? "用雷雳数据线连接另一台 Mac 后，在两台电脑上都运行 同桌 · TwinDesk。"
+                     : "等待对方电脑上的 同桌 · TwinDesk 响应…")
                     .foregroundStyle(.secondary)
             }
         }
@@ -271,7 +282,7 @@ private struct PermissionSection: View {
             if let error = model.status.captureError {
                 Text(error).font(.caption).foregroundStyle(.red)
             }
-            Text("授权后点“重试”；若仍不生效，请退出并重新打开 OpenShareMouse。")
+            Text("授权后点“重试”；若仍不生效，请退出并重新打开 同桌 · TwinDesk。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

@@ -38,6 +38,7 @@ message Envelope {
     MouseButton mouse_button = 49;
     Scroll scroll = 50;
     Key key = 51;
+    CapsLock caps_lock = 52;
 
     DragOffer drag_offer = 64;
     DragEnd drag_end = 65;
@@ -125,6 +126,13 @@ message Key {
   bool down = 2;
   bool repeat = 3;
   uint64 flags = 4;
+}
+
+// Minor 3: physical Caps Lock edges, never the controller's lock state.
+// Only sent to peers advertising minor >= 3; repeats are suppressed.
+message CapsLock {
+  uint64 epoch = 1;
+  bool down = 2;
 }
 
 // ---- File transfer (report §10) ----------------------------------------

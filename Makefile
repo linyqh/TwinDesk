@@ -32,7 +32,7 @@ fmt:
 	cargo fmt
 
 run: app
-	open build/app/OpenShareMouse.app
+	open "build/app/同桌 · TwinDesk.app"
 
 clean:
 	cargo clean

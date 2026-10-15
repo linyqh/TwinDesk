@@ -17,7 +17,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use osm_core::caps_lock::{CapsAction, CapsGesture};
 use osm_core::{Desktop, Side};
+use osm_platform_macos::input_source::{caps_lock_state, set_caps_lock, switch_input_source};
 use osm_platform_macos::{
     Capture, CaptureMode, CursorLock, FnRemap, Injector, InputEvent, ThunderboltStatus,
     display_rects,
@@ -239,6 +241,7 @@ struct Connection {
     bulk_port: Option<u16>,
     /// Peer supports explicit file portals (protocol minor >= 2).
     portal_capable: bool,
+    caps_capable: bool,
 }
 
 struct State {
@@ -251,6 +254,8 @@ struct State {
     injector: Injector,
     cursor: CursorLock,
     fn_remap: FnRemap,
+    caps_gesture: CapsGesture,
+    clock: Instant,
     router: Router,
 
     thunderbolt: ThunderboltStatus,
@@ -287,6 +292,8 @@ impl State {
             injector: Injector::new(),
             cursor: CursorLock::default(),
             fn_remap: FnRemap::default(),
+            caps_gesture: CapsGesture::default(),
+            clock: Instant::now(),
             router: Router::new(desktop, Side::Right),
             thunderbolt: ThunderboltStatus::default(),
             net_error: None,
@@ -301,10 +308,13 @@ impl State {
             transfers,
             downloads,
         };
-        // A crash while forwarding would leave Fn remapped; undo that first.
+        // Recover both the old Fn-only and the new Fn/Caps crash mappings.
         let stale = FnRemap::clear_stale();
         if stale > 0 {
-            tracing::info!(keyboards = stale, "cleared Fn remap left by a previous run");
+            tracing::info!(
+                keyboards = stale,
+                "cleared keyboard remap left by a previous run"
+            );
         }
         s.start_capture();
         s
@@ -347,6 +357,10 @@ impl State {
             self.tick();
             if last_desktop_check.elapsed() >= Duration::from_secs(1) {
                 last_desktop_check = Instant::now();
+                if matches!(self.router.role(), Role::Controlling { .. }) {
+                    self.fn_remap
+                        .engage(self.conn.as_ref().is_some_and(|c| c.caps_capable));
+                }
                 let fx = self.router.set_desktop(current_desktop());
                 self.apply(fx);
             }
@@ -523,6 +537,7 @@ impl State {
             ping_sent: None,
             bulk_port,
             portal_capable: false,
+            caps_capable: false,
         });
         self.last_error = None;
         self.send(Payload::Hello(v1::Hello {
@@ -550,6 +565,7 @@ impl State {
         if let Some(c) = &mut self.conn {
             c.last_seen = Instant::now();
             c.portal_capable = env.protocol_minor >= 2;
+            c.caps_capable = env.protocol_minor >= 3;
         }
         let Some(payload) = env.payload else { return };
         match payload {
@@ -620,6 +636,37 @@ impl State {
             c.ping_sent = Some((nonce, Instant::now()));
             self.send(Payload::Ping(v1::Ping { nonce }));
         }
+        if matches!(self.router.role(), Role::Controlled { .. })
+            && let Some(action) = self.caps_gesture.poll(self.clock.elapsed())
+        {
+            self.apply_caps_action(action);
+        }
+    }
+
+    fn apply_caps_action(&mut self, action: CapsAction) {
+        let result = (|| {
+            let locked = caps_lock_state()?;
+            match action {
+                CapsAction::ToggleLock => set_caps_lock(!locked)?,
+                CapsAction::ShortPress if locked => set_caps_lock(false)?,
+                CapsAction::ShortPress => {
+                    if !switch_input_source()? {
+                        set_caps_lock(true)?;
+                    }
+                }
+            }
+            // IOHID lock changes do not immediately update Quartz flags. Keep
+            // an authoritative snapshot for every subsequent injected event.
+            self.injector.use_target_caps_lock(Some(caps_lock_state()?));
+            Ok::<(), String>(())
+        })();
+        if let Err(error) = result {
+            tracing::warn!(%error, "remote Caps Lock failed");
+            self.last_error = Some(error);
+            // Do not type subsequent characters in an unintended input source.
+            let fx = self.router.abort();
+            self.apply(fx);
+        }
     }
 
     fn send(&mut self, payload: Payload) {
@@ -642,22 +689,49 @@ impl State {
                     }
                     // Before forwarding starts, so no Fn press can slip through
                     // to a local app that taps ahead of us.
-                    self.fn_remap.engage();
+                    let caps = self.conn.as_ref().is_some_and(|c| c.caps_capable);
+                    self.router.set_caps_lock_forwarding(caps);
+                    self.fn_remap.engage(caps);
                     self.cursor.lock(park);
                     self.set_mode(CaptureMode::Forwarding);
                 }
                 Effect::EndForwarding { at } => {
+                    self.router.set_caps_lock_forwarding(false);
                     self.set_mode(CaptureMode::Local);
                     self.fn_remap.release();
                     self.cursor.unlock(Some(at));
                 }
                 Effect::BeginControlled { at } => {
+                    self.caps_gesture.cancel();
+                    if self.conn.as_ref().is_some_and(|c| c.caps_capable) {
+                        match caps_lock_state() {
+                            Ok(locked) => self.injector.use_target_caps_lock(Some(locked)),
+                            Err(error) => {
+                                self.last_error = Some(error);
+                                let fx = self.router.abort();
+                                self.apply(fx);
+                                continue;
+                            }
+                        }
+                    }
                     self.injector.warp(at);
                     self.set_mode(CaptureMode::Controlled);
                 }
                 Effect::EndControlled { .. } => {
+                    self.caps_gesture.cancel();
+                    if self.conn.as_ref().is_some_and(|c| c.caps_capable)
+                        && let Ok(locked) = caps_lock_state()
+                    {
+                        self.injector.use_target_caps_lock(Some(locked));
+                    }
                     self.injector.release_all();
+                    self.injector.use_target_caps_lock(None);
                     self.set_mode(CaptureMode::Local);
+                }
+                Effect::CapsLock { down } => {
+                    if let Some(action) = self.caps_gesture.edge(down, self.clock.elapsed()) {
+                        self.apply_caps_action(action);
+                    }
                 }
                 Effect::InjectMove { to, dx, dy } => self.injector.move_to(to, dx, dy),
                 Effect::InjectButton {

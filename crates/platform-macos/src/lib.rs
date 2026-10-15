@@ -9,12 +9,13 @@
 pub mod drag_pasteboard;
 pub mod fn_remap;
 pub mod input;
+pub mod input_source;
 pub mod permissions;
 mod sys;
 pub mod thunderbolt;
 
 pub use drag_pasteboard::DragPasteboard;
-pub use fn_remap::{FnRemap, REMAPPED_FN_KEYCODE};
+pub use fn_remap::{FnRemap, REMAPPED_CAPS_LOCK_KEYCODE, REMAPPED_FN_KEYCODE};
 pub use input::{
     Capture, CaptureError, CaptureMode, CursorLock, Injector, InputEvent, UntrackedLeft,
     cursor_position, display_rects, physical_left_down,

@@ -134,7 +134,7 @@ final class AppModel {
         switch status.link {
         case .noCable: "未连接雷雳数据线"
         case .cableNoNetwork: "已连接数据线，网络未就绪"
-        case .searching: "已连接数据线，等待对方启动 OpenShareMouse"
+        case .searching: "已连接数据线，等待对方启动 同桌 · TwinDesk"
         case .connecting: "正在连接…"
         case .connected: "已连接"
         }

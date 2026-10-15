@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds the Swift app and wraps it into a signed OpenShareMouse.app.
+# Builds the Swift app and wraps it into a signed 同桌 · TwinDesk.app.
 #
 #   scripts/bundle-app.sh [debug|release]   (default: debug)
 #
@@ -17,8 +17,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG="${1:-debug}"
 APP_DIR="$ROOT/apps/macos"
 OUT="$ROOT/build/app"
-APP="$OUT/OpenShareMouse.app"
+APP="$OUT/同桌 · TwinDesk.app"
 
+# Stable identity across the product rename, for existing macOS settings.
 BUNDLE_ID="${OSM_BUNDLE_ID:-io.github.opensharemouse.OpenShareMouse}"
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
 BUILD_NUMBER="${OSM_BUILD_NUMBER:-$(git -C "$ROOT" rev-list --count HEAD 2>/dev/null || echo 1)}"
@@ -32,12 +33,15 @@ if [[ ! -d "$APP_DIR/Frameworks/OSMCoreFFI.xcframework" ]]; then
   "$ROOT/scripts/build-rust.sh" "$CONFIG"
 fi
 
-swift build --package-path "$APP_DIR" -c "$CONFIG" --product OpenShareMouse
-BIN="$(swift build --package-path "$APP_DIR" -c "$CONFIG" --show-bin-path)/OpenShareMouse"
+swift build --package-path "$APP_DIR" -c "$CONFIG" --product TwinDesk
+BIN_DIR="$(swift build --package-path "$APP_DIR" -c "$CONFIG" --show-bin-path)"
+BIN="$BIN_DIR/TwinDesk"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$BIN" "$APP/Contents/MacOS/OpenShareMouse"
+cp "$BIN" "$APP/Contents/MacOS/TwinDesk"
+cp -R "$BIN_DIR/TwinDesk_OpenShareMouse.bundle" "$APP/Contents/Resources/"
+bash "$ROOT/scripts/build-icon.sh" "$APP/Contents/Resources/TwinDesk.icns"
 sed -e "s/\$(BUNDLE_ID)/$BUNDLE_ID/" \
     -e "s/\$(VERSION)/$VERSION/" \
     -e "s/\$(BUILD_NUMBER)/$BUILD_NUMBER/" \

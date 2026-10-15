@@ -7,10 +7,10 @@
 import PackageDescription
 
 let package = Package(
-    name: "OpenShareMouse",
+    name: "TwinDesk",
     platforms: [.macOS(.v14)],
     products: [
-        .executable(name: "OpenShareMouse", targets: ["OpenShareMouse"]),
+        .executable(name: "TwinDesk", targets: ["OpenShareMouse"]),
     ],
     targets: [
         // Static Rust core produced by scripts/build-rust.sh.
@@ -36,7 +36,8 @@ let package = Package(
         .executableTarget(
             name: "OpenShareMouse",
             dependencies: ["OSMCore"],
-            path: "Sources/OpenShareMouse"
+            path: "Sources/OpenShareMouse",
+            resources: [.copy("Resources/TwinDesk.png")]
         ),
         .testTarget(
             name: "OpenShareMouseTests",

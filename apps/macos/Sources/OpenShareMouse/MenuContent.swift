@@ -25,7 +25,7 @@ struct MenuContent: View {
             openWindow(id: "main")
             NSApplication.shared.activate()
         }
-        Button("退出 OpenShareMouse") { NSApplication.shared.terminate(nil) }
+        Button("退出 同桌 · TwinDesk") { NSApplication.shared.terminate(nil) }
             .keyboardShortcut("q")
     }
 }

@@ -21,7 +21,7 @@ use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use osm_core::keys::modifier_is_down;
+use osm_core::keys::{FLAG_ALPHA_SHIFT, KEY_CAPS_LOCK, modifier_is_down, target_caps_flags};
 use osm_model::{LogicalPoint, LogicalRect};
 
 use crate::sys::*;
@@ -93,7 +93,7 @@ pub enum InputEvent {
 
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
-    #[error("无法创建事件监听（请在“系统设置 > 隐私与安全性 > 辅助功能”中允许 OpenShareMouse）")]
+    #[error("无法创建事件监听（请在“系统设置 > 隐私与安全性 > 辅助功能”中允许 同桌 · TwinDesk）")]
     TapCreateFailed,
     #[error("事件监听线程启动失败")]
     ThreadFailed,
@@ -297,7 +297,12 @@ unsafe extern "C" fn tap_callback(
             event
         }
         CaptureMode::Controlled => {
-            if !injected && is_physical_activity(event_type) {
+            // Caps Lock is a flagsChanged event, not keyDown. A local press
+            // must reclaim control before cached target lock flags are reused.
+            let local_caps = event_type == kCGEventFlagsChanged
+                && unsafe { CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode) }
+                    == i64::from(KEY_CAPS_LOCK);
+            if !injected && (is_physical_activity(event_type) || local_caps) {
                 let _ = state.tx.try_send(InputEvent::LocalActivity);
             }
             event
@@ -469,6 +474,7 @@ pub struct Injector {
     buttons_down: [bool; 32],
     keys_down: Vec<u16>,
     flags: u64,
+    target_caps_lock: Option<bool>,
 }
 
 // SAFETY: the CGEventSource is only used from the thread owning the Injector;
@@ -499,6 +505,19 @@ impl Injector {
             buttons_down: [false; 32],
             keys_down: Vec::new(),
             flags: 0,
+            target_caps_lock: None,
+        }
+    }
+
+    pub fn use_target_caps_lock(&mut self, locked: Option<bool>) {
+        self.target_caps_lock = locked;
+    }
+
+    fn localize_flags(&self, flags: u64) -> u64 {
+        if let Some(locked) = self.target_caps_lock {
+            target_caps_flags(flags, if locked { FLAG_ALPHA_SHIFT } else { 0 })
+        } else {
+            flags
         }
     }
 
@@ -577,6 +596,7 @@ impl Injector {
             if e.is_null() {
                 return;
             }
+            CGEventSetFlags(e, self.localize_flags(self.flags));
             if continuous {
                 CGEventSetIntegerValueField(e, kCGScrollWheelEventIsContinuous, 1);
                 CGEventSetIntegerValueField(e, kCGScrollWheelEventScrollPhase, scroll_phase as i64);
@@ -598,6 +618,7 @@ impl Injector {
     }
 
     pub fn key(&mut self, keycode: u16, down: bool, repeat: bool, flags: u64) {
+        let flags = self.localize_flags(flags);
         if down {
             if !repeat && !self.keys_down.contains(&keycode) {
                 self.keys_down.push(keycode);
@@ -644,7 +665,7 @@ impl Injector {
             unsafe {
                 let e = CGEventCreateKeyboardEvent(self.source(), keycode, false);
                 if !e.is_null() {
-                    CGEventSetFlags(e, 0);
+                    CGEventSetFlags(e, self.localize_flags(0));
                     self.finish(e);
                 }
             }
@@ -709,7 +730,7 @@ impl Injector {
             if e.is_null() {
                 return;
             }
-            CGEventSetFlags(e, self.flags);
+            CGEventSetFlags(e, self.localize_flags(self.flags));
             configure(e);
             self.finish(e);
         }

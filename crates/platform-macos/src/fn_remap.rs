@@ -1,4 +1,4 @@
-//! Keeps the local Fn key away from local apps while forwarding.
+//! Keeps the local Fn and Caps Lock keys away from local apps while forwarding.
 //!
 //! Some apps (WeChat's WeType input method is the motivating case) watch the
 //! Fn/Globe key with their own event tap, install it at the head of the HID
@@ -14,6 +14,10 @@
 //! Fn does, and a remapped physical Fn arrives at the tail of the chain as
 //! F19 (keycode 80).
 //!
+//! With a minor-3 peer, also remap Caps Lock to F18. Its genuine down/up
+//! edges become an epoch-scoped CapsLock message; input-source selection
+//! and the latched lock state are handled exclusively on the target.
+//!
 //! Only keyboard services without a user mapping of their own are touched,
 //! and only those are cleared again, so an existing remap (hidutil,
 //! Karabiner-style tools) is never overwritten.
@@ -24,11 +28,15 @@ use crate::sys::{CFRelease, CFStringRef};
 
 /// macOS virtual keycode of F19 as delivered after the remap.
 pub const REMAPPED_FN_KEYCODE: u16 = 80;
+/// Reserved while controlling a peer supporting physical Caps Lock (minor 3).
+pub const REMAPPED_CAPS_LOCK_KEYCODE: u16 = 79; // F18
 
 /// HID usages, encoded as `page << 32 | usage`.
 const HID_FN_APPLE_VENDOR: i64 = 0xFF_0000_0003; // AppleVendor top case, keyboard Fn
 const HID_FN_APPLE_VENDOR_KEYBOARD: i64 = 0xFF01_0000_0003; // AppleVendor keyboard page, Fn
 const HID_F19: i64 = 0x7_0000_006E;
+const HID_CAPS_LOCK: i64 = 0x7_0000_0039;
+const HID_F18: i64 = 0x7_0000_006D;
 
 const USAGE_PAGE_GENERIC_DESKTOP: u32 = 1;
 const USAGE_KEYBOARD: u32 = 6;
@@ -165,11 +173,16 @@ impl Keys {
         })
     }
 
-    /// Our mapping: both Fn encodings to F19.
-    fn ours(&self) -> Cf {
+    /// Both Fn encodings to F19; optionally Caps Lock to F18.
+    fn ours(&self, caps_lock: bool) -> Cf {
         let a = self.entry(HID_FN_APPLE_VENDOR, HID_F19);
         let b = self.entry(HID_FN_APPLE_VENDOR_KEYBOARD, HID_F19);
-        Self::array(&[&a, &b])
+        let caps = self.entry(HID_CAPS_LOCK, HID_F18);
+        if caps_lock {
+            Self::array(&[&a, &b, &caps])
+        } else {
+            Self::array(&[&a, &b])
+        }
     }
 }
 
@@ -235,10 +248,12 @@ fn current_mapping(keys: &Keys, service: IOHIDServiceClientRef) -> Option<Cf> {
 
 fn is_ours(keys: &Keys, mapping: &Cf) -> bool {
     // SAFETY: both are valid CF objects.
-    unsafe { CFEqual(mapping.0, keys.ours().0) != 0 }
+    unsafe {
+        CFEqual(mapping.0, keys.ours(false).0) != 0 || CFEqual(mapping.0, keys.ours(true).0) != 0
+    }
 }
 
-/// Remaps Fn while alive (between `engage` and `release`).
+/// Remaps Fn and optionally Caps Lock while alive (between `engage` and `release`).
 #[derive(Debug, Default)]
 pub struct FnRemap {
     /// Registry ids of the services we set, so we only ever clear those.
@@ -251,28 +266,26 @@ impl FnRemap {
     }
 
     /// Remaps Fn to F19 on every keyboard without a user mapping. Returns
-    /// how many keyboards were remapped.
-    pub fn engage(&mut self) -> usize {
-        if self.is_engaged() {
-            return self.engaged.len();
-        }
+    /// how many keyboards were remapped. Repeated calls discover newly attached
+    /// keyboards without touching existing user mappings.
+    pub fn engage(&mut self, caps_lock: bool) -> usize {
         let Some(services) = Services::keyboards() else {
             return 0;
         };
         let keys = Keys::new();
-        let ours = keys.ours();
+        let ours = keys.ours(caps_lock);
         for s in services.iter() {
-            if current_mapping(&keys, s).is_some() {
+            let Some(id) = registry_id(s) else { continue };
+            if self.engaged.contains(&id) || current_mapping(&keys, s).is_some() {
                 continue;
             }
+            // Get the id BEFORE setting a mapping: every change must be recoverable.
             // SAFETY: valid service, key and CFArray value.
-            if unsafe { IOHIDServiceClientSetProperty(s, keys.user_mapping.0, ours.0) } != 0
-                && let Some(id) = registry_id(s)
-            {
+            if unsafe { IOHIDServiceClientSetProperty(s, keys.user_mapping.0, ours.0) } != 0 {
                 self.engaged.push(id);
             }
         }
-        tracing::debug!(keyboards = self.engaged.len(), "fn remap engaged");
+        tracing::debug!(keyboards = self.engaged.len(), "keyboard remap engaged");
         self.engaged.len()
     }
 
@@ -298,7 +311,7 @@ impl FnRemap {
                 unsafe { IOHIDServiceClientSetProperty(s, keys.user_mapping.0, empty.0) };
             }
         }
-        tracing::debug!("fn remap released");
+        tracing::debug!("keyboard remap released");
     }
 
     /// Removes a mapping identical to ours left behind by a crash. Mappings
@@ -347,7 +360,11 @@ mod tests {
     #[test]
     fn our_mapping_is_recognised_as_ours() {
         let keys = Keys::new();
-        assert!(is_ours(&keys, &keys.ours()));
+        assert!(is_ours(&keys, &keys.ours(true)));
+        // Upgrading must also recover the previous Fn-only crash mapping.
+        assert!(is_ours(&keys, &keys.ours(false)));
+        let foreign_caps = Keys::array(&[&keys.entry(HID_CAPS_LOCK, HID_F18)]);
+        assert!(!is_ours(&keys, &foreign_caps));
         let other = Keys::array(&[&keys.entry(HID_FN_APPLE_VENDOR, 0x7_0000_0004)]);
         assert!(!is_ours(&keys, &other));
     }
@@ -362,7 +379,7 @@ mod tests {
             "stale mapping present before test"
         );
         let mut r = FnRemap::default();
-        let n = r.engage();
+        let n = r.engage(true);
         let during = keyboards_with_our_mapping();
         assert_eq!(during.iter().filter(|m| **m).count(), n);
         r.release();
@@ -373,7 +390,7 @@ mod tests {
     fn drop_releases() {
         {
             let mut r = FnRemap::default();
-            r.engage();
+            r.engage(true);
         }
         assert!(keyboards_with_our_mapping().iter().all(|m| !m));
     }

@@ -1,11 +1,11 @@
 import SwiftUI
 
 @main
-struct OpenShareMouseApp: App {
+struct TwinDeskApp: App {
     @State private var model = AppModel()
 
     var body: some Scene {
-        Window("OpenShareMouse", id: "main") {
+        Window("同桌 · TwinDesk", id: "main") {
             MainView()
                 .environment(model)
         }
@@ -15,7 +15,12 @@ struct OpenShareMouseApp: App {
             MenuContent()
                 .environment(model)
         } label: {
-            Image(systemName: model.menuBarSymbol)
+            HStack(spacing: 3) {
+                BrandIcon(size: 22)
+                Image(systemName: model.menuBarSymbol)
+                    .font(.system(size: 10))
+            }
+            .accessibilityLabel("同桌 · TwinDesk，\(model.linkTitle)，\(model.roleTitle)")
         }
     }
 }
