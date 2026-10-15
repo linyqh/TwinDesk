@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Shared artwork for the window and menu bar; also used to build TwinDesk.icns.
+/// Window artwork; also used to build TwinDesk.icns.
 struct BrandIcon: View {
     var size: CGFloat
 

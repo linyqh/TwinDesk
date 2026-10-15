@@ -14,6 +14,8 @@
 	<string>6.0</string>
 	<key>CFBundleIconFile</key>
 	<string>TwinDesk.icns</string>
+	<key>CFBundleIconName</key>
+	<string>TwinDesk</string>
 	<key>CFBundleName</key>
 	<string>同桌 · TwinDesk</string>
 	<key>CFBundlePackageType</key>

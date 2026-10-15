@@ -1,0 +1,24 @@
+{
+  "fill": {
+    "solid": "srgb:0.20000,0.60000,0.98000,1.00000"
+  },
+  "groups": [
+    {
+      "layers": [
+        {
+          "image-name": "TwinDesk.png",
+          "name": "Shared desk",
+          "position": {
+            "scale": 1.2,
+            "translation-in-points": [0, 0]
+          }
+        }
+      ],
+      "name": "Artwork",
+      "shadow": { "kind": "neutral", "opacity": 0 },
+      "translucency": { "enabled": false, "value": 0 },
+      "specular": false
+    }
+  ],
+  "supported-platforms": { "squares": ["macOS"] }
+}

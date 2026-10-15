@@ -17,6 +17,8 @@ final class AppModel {
     private var portal: TransferPortal?
     private(set) var preparingTransfer = false
     private(set) var transferError: String?
+    private(set) var isRestarting = false
+    private(set) var restartError: String?
     let downloadsDirectory: URL
     private var refreshTask: Task<Void, Never>?
 
@@ -106,7 +108,38 @@ final class AppModel {
     func setPeerSide(_ side: ScreenSide) { agent.setPeerSide(side: side) }
     func setSharingEnabled(_ on: Bool) { agent.setSharingEnabled(enabled: on) }
     func returnToLocal() { agent.returnToLocal() }
-    func retryCapture() { agent.retryCapture() }
+    func restartApplication() {
+        guard !isRestarting else { return }
+        restartError = nil
+        let bundleURL = Bundle.main.bundleURL
+        guard bundleURL.pathExtension == "app" else {
+            restartError = "请从已安装的 同桌 · TwinDesk 应用中重启。"
+            return
+        }
+
+        // Wait for this process to exit before reopening the same signed bundle.
+        // A fixed delay can race shutdown and merely activate the old process.
+        // Pass paths as arguments so spaces and shell characters stay literal.
+        let relauncher = Process()
+        relauncher.executableURL = URL(fileURLWithPath: "/bin/sh")
+        relauncher.arguments = [
+            "-c",
+            "while /bin/kill -0 \"$1\" 2>/dev/null; do /bin/sleep 0.2; done; exec /usr/bin/open \"$2\"",
+            "twindesk-relaunch",
+            String(ProcessInfo.processInfo.processIdentifier),
+            bundleURL.path,
+        ]
+        relauncher.standardInput = FileHandle.nullDevice
+        relauncher.standardOutput = FileHandle.nullDevice
+        relauncher.standardError = FileHandle.nullDevice
+        do {
+            try relauncher.run()
+            isRestarting = true
+            NSApplication.shared.terminate(nil)
+        } catch {
+            restartError = "无法自动重启，请退出后重新打开 同桌 · TwinDesk。"
+        }
+    }
     func cancelTransfer(_ t: TransferStatus) { agent.cancelTransfer(id: t.id) }
     func dismissTransfer(_ t: TransferStatus) { agent.dismissTransfer(id: t.id) }
 
@@ -120,15 +153,6 @@ final class AppModel {
     }
 
     // MARK: Presentation
-
-    var menuBarSymbol: String {
-        if !allPermissionsGranted { return "exclamationmark.triangle" }
-        if !activeTransfers.isEmpty { return "arrow.left.arrow.right.circle" }
-        switch status.role {
-        case .controlling, .controlled: return "computermouse.fill"
-        case .local: return status.link == .connected ? "cable.connector" : "cable.connector.slash"
-        }
-    }
 
     var linkTitle: String {
         switch status.link {

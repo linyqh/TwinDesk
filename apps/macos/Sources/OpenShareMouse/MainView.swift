@@ -330,7 +330,7 @@ private struct PermissionSection: View {
                 Label("需要“辅助功能”权限", systemImage: "exclamationmark.triangle.fill")
                     .font(.headline)
                     .foregroundStyle(.orange)
-                Text(model.status.captureError ?? "授权后点“重试”；若仍不生效，请重新打开 同桌 · TwinDesk。")
+                Text("请在系统设置中允许 同桌 · TwinDesk 使用“辅助功能”，然后点“重启应用”使权限生效。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .wrapping()
@@ -340,10 +340,17 @@ private struct PermissionSection: View {
                         model.openPrivacySettings(.accessibility)
                     }
                     .buttonStyle(.borderedProminent)
-                    Button("重试") { model.retryCapture() }
+                    Button(model.isRestarting ? "正在重启…" : "重启应用") { model.restartApplication() }
+                        .disabled(model.isRestarting)
                 }
                 .controlSize(.small)
                 .padding(.top, 2)
+                if let error = model.restartError ?? model.status.captureError {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .wrapping()
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }

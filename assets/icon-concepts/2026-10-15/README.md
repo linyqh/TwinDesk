@@ -2,7 +2,9 @@
 
 使用内置 image_gen 生成，各方案为独立 PNG。已选定 **02 共享桌面** 并接入应用文件、主窗口、菜单栏和项目 README。
 
-正式源图为 [TwinDesk.png](../../../apps/macos/Sources/OpenShareMouse/Resources/TwinDesk.png)，保留选定原图的构图与透明背景。打包脚本使用同一源图生成 16–1024 像素的 macOS 图标并封装为 `TwinDesk.icns`。
+正式源图为 [TwinDesk.png](../../../apps/macos/Sources/OpenShareMouse/Resources/TwinDesk.png)，应用内仍使用该透明 PNG。系统图标使用 [Icon Composer 配置](../../../apps/macos/Support/TwinDesk.icon/icon.json)，由打包脚本临时导入同一源图，使用 Xcode 26+ 的 `actool` 编译为 `Assets.car` 和兼容旧系统的 `TwinDesk.icns`。两者均须放在应用的 `Contents/Resources`，并通过 `CFBundleIconName = TwinDesk` 引用原生图标。
+
+原来的纯 ICNS 在新系统中会被缩小并套上灰色底板。原生图标将源图放大至 1.2 倍，使蓝色背景覆盖系统蒙版，关闭额外的玻璃和投影效果，保留双屏木桌的原始外观。不要退回只复制 ICNS 的打包方式。
 
 | 编号 | 方案 | 方向 |
 |---|---|---|
