@@ -4,6 +4,7 @@
 //! polls for a `Status` snapshot. All session state is owned by one engine
 //! thread; other threads only feed it messages.
 
+mod clipboard;
 mod engine;
 mod link;
 pub mod router;

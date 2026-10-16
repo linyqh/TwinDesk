@@ -21,13 +21,14 @@ use osm_core::caps_lock::{CapsAction, CapsGesture};
 use osm_core::{Desktop, Side};
 use osm_platform_macos::input_source::{caps_lock_state, set_caps_lock, switch_input_source};
 use osm_platform_macos::{
-    Capture, CaptureMode, CursorLock, FnRemap, Injector, InputEvent, ThunderboltStatus,
+    Capture, CaptureMode, CursorLock, FnRemap, Injector, InputEvent, Pasteboard, ThunderboltStatus,
     display_rects,
 };
 use osm_protocol::envelope;
 use osm_protocol::v1::{self, envelope::Payload};
 use osm_transport::{DiscoveredPeer, FrameReader, FrameWriter, ReadError, tune};
 
+use crate::clipboard::Clipboard;
 use crate::link;
 use crate::router::{Effect, Role, Router};
 use crate::transfers::Transfers;
@@ -101,6 +102,10 @@ pub(crate) enum Msg {
         dialed: bool,
     },
     DialFailed(String),
+    ClipboardOffer {
+        conn: u64,
+        offer: v1::ClipboardOffer,
+    },
     Frame {
         conn: u64,
         env: v1::Envelope,
@@ -156,7 +161,7 @@ impl Engine {
         )];
         let engine_tx = tx.clone();
         let engine_status = status.clone();
-        let transfers = Transfers::new();
+        let transfers = Transfers::with_clipboard(Arc::new(Clipboard::new(Pasteboard::general())));
         let engine_transfers = transfers.clone();
         threads.push(
             thread::Builder::new()
@@ -242,6 +247,7 @@ struct Connection {
     /// Peer supports explicit file portals (protocol minor >= 2).
     portal_capable: bool,
     caps_capable: bool,
+    clipboard_capable: bool,
 }
 
 struct State {
@@ -405,6 +411,11 @@ impl State {
                 self.dialing = false;
                 self.last_error = Some(e);
             }
+            Msg::ClipboardOffer { conn, offer } => {
+                if self.conn.as_ref().is_some_and(|c| c.id == conn) {
+                    self.send(Payload::ClipboardOffer(offer));
+                }
+            }
             Msg::Frame { conn, env } => {
                 if self.conn.as_ref().is_some_and(|c| c.id == conn) {
                     self.on_frame(env);
@@ -468,6 +479,20 @@ impl State {
             return Err("连接已断开，请重新投放".into());
         }
         Ok(())
+    }
+
+    /// The user is moving to the other Mac: let it paste what was copied here.
+    fn offer_clipboard(&self) {
+        let Some(c) = &self.conn else { return };
+        let Some(port) = c.bulk_port else { return };
+        if !c.clipboard_capable || !self.sharing_enabled || self.peer.is_none() {
+            return;
+        }
+        let (tx, conn) = (self.tx.clone(), c.id);
+        self.transfers
+            .offer_clipboard(random_u64(), random_bytes(), port, move |offer| {
+                let _ = tx.send(Msg::ClipboardOffer { conn, offer });
+            });
     }
 
     /// Lower device id dials, so exactly one TCP connection forms.
@@ -538,6 +563,7 @@ impl State {
             bulk_port,
             portal_capable: false,
             caps_capable: false,
+            clipboard_capable: false,
         });
         self.last_error = None;
         self.send(Payload::Hello(v1::Hello {
@@ -566,6 +592,7 @@ impl State {
             c.last_seen = Instant::now();
             c.portal_capable = env.protocol_minor >= 2;
             c.caps_capable = env.protocol_minor >= 3;
+            c.clipboard_capable = env.protocol_minor >= 4;
         }
         let Some(payload) = env.payload else { return };
         match payload {
@@ -610,6 +637,11 @@ impl State {
                 }
             }
             Payload::PortalReject(r) => self.transfers.reject_offer(r.transfer_id, &r.message),
+            Payload::ClipboardOffer(o) => {
+                if self.sharing_enabled && self.peer.is_some() {
+                    self.transfers.receive_clipboard(o);
+                }
+            }
             // Explicitly cancel legacy proxy drags; do not synthesize a drop.
             Payload::DragOffer(o) => self.send(Payload::DragEnd(v1::DragEnd {
                 drag_id: o.drag_id,
@@ -694,6 +726,7 @@ impl State {
                     self.fn_remap.engage(caps);
                     self.cursor.lock(park);
                     self.set_mode(CaptureMode::Forwarding);
+                    self.offer_clipboard();
                 }
                 Effect::EndForwarding { at } => {
                     self.router.set_caps_lock_forwarding(false);
@@ -727,6 +760,8 @@ impl State {
                     self.injector.release_all();
                     self.injector.use_target_caps_lock(None);
                     self.set_mode(CaptureMode::Local);
+                    // Copies made while controlled follow the cursor back.
+                    self.offer_clipboard();
                 }
                 Effect::CapsLock { down } => {
                     if let Some(action) = self.caps_gesture.edge(down, self.clock.elapsed()) {

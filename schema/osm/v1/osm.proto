@@ -44,6 +44,7 @@ message Envelope {
     DragEnd drag_end = 65;
     PortalOffer portal_offer = 66;
     PortalReject portal_reject = 67;
+    ClipboardOffer clipboard_offer = 68;
   }
 }
 
@@ -187,6 +188,17 @@ message PortalReject {
   string message = 2;
 }
 
+// ---- Clipboard hand-off (minor 4) ----------------------------------------
+
+// Sent by the Mac the user is switching away from when its clipboard changed
+// since the last hand-off. Carries no content: the peer fetches it once over a
+// bulk connection with ClipboardFetch. Only sent to peers with minor >= 4.
+message ClipboardOffer {
+  uint64 offer_id = 1;
+  bytes token = 2;
+  uint32 bulk_port = 3;
+}
+
 // Receiver -> sender, after verification and atomic commit. An empty error
 // means the file is saved; EOF alone must never count as success.
 message TransferReceipt {
@@ -212,7 +224,24 @@ message BulkFrame {
     TransferDone done = 6;
     TransferFailed failed = 7;
     TransferReceipt receipt = 8;
+    ClipboardFetch clipboard_fetch = 9;
+    ClipboardFormat clipboard_format = 10;
   }
+}
+
+// Opens a clipboard bulk connection instead of a FetchRequest. The sender
+// answers, for each representation, a ClipboardFormat followed by FileChunks
+// totalling `size` bytes, then TransferDone; or TransferFailed if the
+// clipboard changed since the offer.
+message ClipboardFetch {
+  uint64 offer_id = 1;
+  bytes token = 2;
+}
+
+message ClipboardFormat {
+  // Pasteboard type identifier, e.g. "public.utf8-plain-text".
+  string type = 1;
+  uint64 size = 2;
 }
 
 message FetchRequest {

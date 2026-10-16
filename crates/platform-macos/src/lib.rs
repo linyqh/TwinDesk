@@ -6,6 +6,7 @@
 
 #![cfg(target_os = "macos")]
 
+pub mod clipboard;
 pub mod drag_pasteboard;
 pub mod fn_remap;
 pub mod input;
@@ -14,6 +15,7 @@ pub mod permissions;
 mod sys;
 pub mod thunderbolt;
 
+pub use clipboard::Pasteboard;
 pub use drag_pasteboard::DragPasteboard;
 pub use fn_remap::{FnRemap, REMAPPED_CAPS_LOCK_KEYCODE, REMAPPED_FN_KEYCODE};
 pub use input::{

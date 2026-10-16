@@ -15,6 +15,8 @@ use osm_protocol::v1::{self, FetchRequest, bulk_frame::Body};
 use osm_protocol::{read_bulk, write_bulk};
 use osm_transfer::{Progress, ProgressSnapshot, TransferError, receive, send};
 
+use crate::clipboard::Clipboard;
+
 /// Recent received IDs prevent duplicate offers from creating duplicate files.
 const MAX_OFFERS: usize = 32;
 /// Preserve the existing bound of 16 outstanding transfers per direction.
@@ -29,6 +31,9 @@ const SOCKET_BUFFER: usize = 1024 * 1024;
 /// Finished or failed transfers stay listed this long for the UI.
 const KEEP_FINISHED: Duration = Duration::from_secs(4);
 const KEEP_FAILED: Duration = Duration::from_secs(60);
+/// A clipboard is at most ~100 MB over a multi-GB/s cable; a stalled fetch
+/// must not overwrite something the user copies much later.
+const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
@@ -103,6 +108,7 @@ struct Inner {
 #[derive(Clone, Default)]
 pub struct Transfers {
     inner: Arc<Mutex<Inner>>,
+    clipboard: Option<Arc<Clipboard>>,
     next_id: Arc<AtomicU64>,
     /// Bumped to retire the current listener thread.
     generation: Arc<AtomicU64>,
@@ -119,10 +125,20 @@ impl Transfers {
         Self::default()
     }
 
+    pub(crate) fn with_clipboard(clipboard: Arc<Clipboard>) -> Self {
+        Self {
+            clipboard: Some(clipboard),
+            ..Self::default()
+        }
+    }
+
     /// A control connection to `ip` is up: start a bulk listener on the
     /// bridge and return its port.
     pub fn connected(&self, ip: Ipv4Addr, if_index: u32) -> Option<u16> {
         self.inner.lock().unwrap().peer = Some(PeerLink { ip, if_index });
+        if let Some(c) = &self.clipboard {
+            c.connected();
+        }
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         let listener = match osm_transport::listen(if_index, 0) {
             Ok(l) => l,
@@ -157,6 +173,9 @@ impl Transfers {
     /// may finish; unclaimed offers must not become accessible to a new peer.
     pub fn disconnected(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
+        if let Some(c) = &self.clipboard {
+            c.disconnected();
+        }
         let mut g = self.inner.lock().unwrap();
         g.listener_port = None;
         g.peer = None;
@@ -309,6 +328,83 @@ impl Transfers {
         };
         let _ = write_bulk(&mut w, &receipt, &mut Default::default()).and_then(|()| w.flush());
         result
+    }
+
+    /// Fetches an offered clipboard on a worker and writes it locally.
+    /// Failures are logged only: a missed hand-off leaves the local
+    /// clipboard as it was, which is what the user sees anyway.
+    /// Prepares a clipboard offer on a worker, since reading the pasteboard
+    /// can stall; `send` hands it back to the engine to put on the wire.
+    pub(crate) fn offer_clipboard(
+        &self,
+        offer_id: u64,
+        token: Vec<u8>,
+        port: u16,
+        send: impl FnOnce(v1::ClipboardOffer) + Send + 'static,
+    ) {
+        let Some(clipboard) = self.clipboard.clone() else {
+            return;
+        };
+        let spawned = thread::Builder::new()
+            .name("osm-clipboard-offer".into())
+            .spawn(move || {
+                if let Some(offer) = clipboard.offer(offer_id, token, port) {
+                    send(offer);
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!("cannot prepare clipboard offer: {e}");
+        }
+    }
+
+    pub(crate) fn receive_clipboard(&self, offer: v1::ClipboardOffer) {
+        let Some(clipboard) = self.clipboard.clone() else {
+            return;
+        };
+        let peer = self.inner.lock().unwrap().peer;
+        let (Some(peer), Ok(port)) = (peer, u16::try_from(offer.bulk_port)) else {
+            return;
+        };
+        if port == 0 || offer.token.len() != 16 {
+            return;
+        }
+        let incoming = clipboard.next_incoming();
+        let spawned = thread::Builder::new()
+            .name("osm-clipboard-receive".into())
+            .spawn(move || {
+                let ticket = clipboard.ticket(incoming);
+                let result = (|| {
+                    let stream = osm_transport::connect_with_timeout(
+                        peer.if_index,
+                        SocketAddrV4::new(peer.ip, port),
+                        CONNECT_TIMEOUT,
+                    )?;
+                    stream.set_read_timeout(Some(CLIPBOARD_TIMEOUT))?;
+                    stream.set_write_timeout(Some(CLIPBOARD_TIMEOUT))?;
+                    osm_transport::tune_bulk(&stream)?;
+                    let mut w = BufWriter::new(stream.try_clone()?);
+                    osm_transfer::clipboard::send_fetch(
+                        &mut w,
+                        v1::ClipboardFetch {
+                            offer_id: offer.offer_id,
+                            token: offer.token,
+                        },
+                    )?;
+                    w.flush()?;
+                    let reps = osm_transfer::clipboard::receive(&mut BufReader::with_capacity(
+                        SOCKET_BUFFER,
+                        stream,
+                    ))?;
+                    clipboard.apply(ticket, reps).map_err(TransferError::Remote)
+                })();
+                match result {
+                    Ok(()) => tracing::info!("clipboard received from peer"),
+                    Err(error) => tracing::info!(%error, "clipboard hand-off skipped"),
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!("cannot start clipboard fetch: {e}");
+        }
     }
 
     pub fn reject_offer(&self, transfer_id: u64, message: &str) {
@@ -495,8 +591,25 @@ impl Transfers {
         };
         let mut w = BufWriter::with_capacity(SOCKET_BUFFER, stream);
         let mut r = BufReader::new(read_half);
-        let req = match send::read_request(&mut r) {
-            Ok(r) => r,
+        let req = match read_bulk(&mut r, &mut Vec::new()) {
+            Ok(Body::Fetch(req)) => req,
+            Ok(Body::ClipboardFetch(fetch)) => {
+                if let Some(clipboard) = &self.clipboard {
+                    let _ = w.get_ref().set_write_timeout(Some(CLIPBOARD_TIMEOUT));
+                    match clipboard.serve(&fetch, &mut w) {
+                        Ok(()) => tracing::info!("clipboard sent to peer"),
+                        Err(error) => tracing::info!(%error, "clipboard fetch refused"),
+                    }
+                } else {
+                    send::refuse(&mut w, &TransferError::NotFound);
+                }
+                let _ = w.flush();
+                return;
+            }
+            Ok(_) => {
+                tracing::debug!("bulk connection opened with an unexpected frame");
+                return;
+            }
             Err(e) => {
                 tracing::debug!("bad bulk request: {e}");
                 return;
@@ -568,7 +681,7 @@ fn tune_bulk(stream: &TcpStream) -> std::io::Result<()> {
     osm_transport::tune_bulk(stream)
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
@@ -863,6 +976,68 @@ mod tests {
         assert!(finished(&pair.b, 1)[0].error.is_some());
         assert!(finished(&pair.a, 1)[0].error.is_some());
         assert_eq!(std::fs::read(not_dir).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn clipboard_follows_the_cursor_over_real_bulk_connections_without_echo() {
+        use osm_platform_macos::Pasteboard;
+        use osm_transfer::clipboard::{HTML, PNG, TEXT};
+        use std::sync::mpsc;
+
+        let left = Arc::new(Clipboard::new(Pasteboard::with_unique_name()));
+        let right = Arc::new(Clipboard::new(Pasteboard::with_unique_name()));
+        let a = Transfers::with_clipboard(left.clone());
+        let b = Transfers::with_clipboard(right.clone());
+        let a_port = a.connected(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let b_port = b.connected(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let offer = |from: &Transfers, port| {
+            let (tx, rx) = mpsc::channel();
+            from.offer_clipboard(random(), vec![3; 16], port, move |o| {
+                let _ = tx.send(o);
+            });
+            rx.recv_timeout(Duration::from_secs(2)).ok()
+        };
+        let wait_text = |board: &Pasteboard, want: &[u8]| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while board.data(TEXT).as_deref() != Some(want) {
+                assert!(Instant::now() < deadline, "clipboard never arrived");
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        // Copied on the right Mac, cursor moves left: Cmd+V on the left pastes it.
+        let image: Vec<u8> = (0..osm_protocol::CHUNK_SIZE + 5).map(|i| i as u8).collect();
+        right
+            .board()
+            .write(&[
+                (HTML.into(), "<i>右边</i>".as_bytes().to_vec()),
+                (TEXT.into(), "右边".as_bytes().to_vec()),
+                (PNG.into(), image.clone()),
+            ])
+            .unwrap();
+        a.receive_clipboard(offer(&b, b_port).expect("right offers"));
+        wait_text(left.board(), "右边".as_bytes());
+        assert_eq!(left.board().data(HTML).unwrap(), "<i>右边</i>".as_bytes());
+        assert_eq!(left.board().data(PNG).unwrap(), image);
+
+        // Moving back without copying must not bounce it back to the right.
+        assert!(offer(&a, a_port).is_none());
+
+        left.board()
+            .write(&[(TEXT.into(), b"left".to_vec())])
+            .unwrap();
+        b.receive_clipboard(offer(&a, a_port).expect("left offers"));
+        wait_text(right.board(), b"left");
+
+        a.cancel_all();
+        b.cancel_all();
+        a.disconnected();
+        b.disconnected();
+    }
+
+    fn random() -> u64 {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        NEXT.fetch_add(1, Ordering::Relaxed)
     }
 
     #[test]

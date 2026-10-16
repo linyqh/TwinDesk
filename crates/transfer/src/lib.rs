@@ -1,11 +1,13 @@
-//! Data exchange: file transfer for cross-machine drag and drop (report §10).
+//! Data exchange: file transfer for cross-machine drag and drop (report §10)
+//! and clipboard hand-off (report §9).
 //!
 //! One bulk connection carries one dropped item. The receiver sends a
 //! `FetchRequest`; the sender streams a manifest and then every file's
 //! contents with a SHA-256 per file. The receiver writes into a staging
 //! directory on the destination volume and commits the verified item with
-//! one exclusive rename. Clipboard offers (CLIP-01) are not implemented yet.
+//! one exclusive rename.
 
+pub mod clipboard;
 mod error;
 mod fsx;
 pub mod manifest;
