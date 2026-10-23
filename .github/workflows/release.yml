@@ -79,6 +79,23 @@ jobs:
       - name: Build and sign app
         run: make release
 
+      - name: Smoke-launch app
+        # Catches launch traps that only this toolchain produces, such as a missing resource bundle.
+        # A trapped process can linger while ReportCrash runs, so check stderr as well as liveness.
+        run: |
+          log="$RUNNER_TEMP/launch.log"
+          "build/app/同桌 · TwinDesk.app/Contents/MacOS/TwinDesk" >"$log" 2>&1 &
+          pid=$!
+          sleep 15
+          alive=0
+          kill -0 "$pid" 2>/dev/null && alive=1
+          kill -9 "$pid" 2>/dev/null || true
+          cat "$log"
+          if (( !alive )) || grep -q "Fatal error" "$log"; then
+            echo "::error::TwinDesk crashed during launch"
+            exit 1
+          fi
+
       - name: Notarize app
         run: scripts/notarize.sh "build/app/同桌 · TwinDesk.app"
 
