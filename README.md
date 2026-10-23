@@ -125,6 +125,27 @@ macOS 按代码签名记录“辅助功能”等授权。如果用 ad-hoc 签名
 
 应用不使用 App Sandbox，不上架 Mac App Store，以 Developer ID 签名加公证的方式分发。
 
+### 发布
+
+推送 `v<版本号>` 标签会触发 `.github/workflows/release.yml`：在 `macos-26` runner 上构建、签名并公证 `.app`，打包为 DMG 再公证，然后创建 GitHub Release，附上 `TwinDesk-<版本号>-arm64-installer.dmg` 和对应的 `.sha256`。标签必须与 `Cargo.toml` 的 `version` 一致；在 Actions 页面手动运行只产出构建产物，不创建 Release。
+
+```sh
+# 先把 Cargo.toml 的 version 改成 1.2.0 并提交
+git tag v1.2.0 && git push origin v1.2.0
+```
+
+仓库需要配置以下 Secrets：
+
+| Secret | 内容 |
+|---|---|
+| `MACOS_CERTIFICATE_P12` | `Developer ID Application` 证书和私钥导出的 .p12，经 `base64 -i cert.p12` 编码 |
+| `MACOS_CERTIFICATE_PASSWORD` | 导出 .p12 时设置的密码 |
+| `APPLE_ID` | 用于公证的 Apple ID |
+| `APPLE_TEAM_ID` | 开发者团队 ID |
+| `APPLE_APP_PASSWORD` | 该 Apple ID 的 App 专用密码 |
+
+本地公证可用 `scripts/notarize.sh <app 或 dmg>`，凭据取自 `OSM_NOTARY_PROFILE`（`xcrun notarytool store-credentials` 保存的配置名），或上表后三个环境变量。
+
 ### 在 Xcode 中开发
 
 用 Xcode 打开 `apps/macos/Package.swift` 即可编辑和调试。但需要授权的功能，必须用 `make run` 构建出的已签名 `.app` 来测试。

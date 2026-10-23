@@ -7,7 +7,13 @@ struct MenuContent: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("同桌 · TwinDesk").font(.headline)
+            HStack(alignment: .firstTextBaseline) {
+                Text("同桌 · TwinDesk").font(.headline)
+                Spacer()
+                if let appVersion {
+                    Text("v\(appVersion)").font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                }
+            }
             Text(model.linkTitle).foregroundStyle(.secondary)
             Text(model.roleTitle).foregroundStyle(.secondary)
             if !model.allPermissionsGranted || model.status.captureError != nil {
@@ -49,6 +55,10 @@ struct MenuContent: View {
         .padding(16)
         .frame(width: 320)
         .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var appVersion: String? {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
     }
 
     private var menuTransfers: [TransferStatus] {
